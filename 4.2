@@ -1,0 +1,501 @@
+# 832 v34.02 — Cell 4-2: EvolutionEngine step() и run() (чистая версия, range(8))
+
+def _evolution_engine_step(self, t):
+    self.age = t
+    self._energy_injected_this_step = 0.0
+    self._energy_taxed_this_step = 0.0
+
+    self._update_sanctuary(t)
+
+    e_before = np.sum(self.field[:,:,CH['energy']])
+    self.field_dynamics(t)
+    self._energy_injected_this_step += np.sum(self.field[:,:,CH['energy']]) - e_before
+
+    e_before = np.sum(self.field[:,:,CH['energy']])
+    ecosystem_pressure(self.field)
+    self._energy_injected_this_step += np.sum(self.field[:,:,CH['energy']]) - e_before
+
+    if not hasattr(self, '_sg_crisis_timer'):
+        self._sg_crisis_timer = 0
+        self._sg_crisis_active = False
+
+    alive_now = [p for p in self.patterns if p.alive]
+    if alive_now:
+        sg_vals = [float(np.mean(np.abs(p.prediction - p.belief))) for p in alive_now]
+        avg_sg = safe_mean(sg_vals, 0.5)
+        if self._sg_crisis_timer > 0:
+            self._sg_crisis_timer -= 1
+            if self._sg_crisis_timer == 0:
+                self._sg_crisis_active = False
+        else:
+            if avg_sg < Config.SG_CRISIS_THRESHOLD:
+                self._sg_crisis_active = True
+                self._sg_crisis_timer = Config.SG_CRISIS_DURATION
+        if self._sg_crisis_active:
+            for p in alive_now:
+                noise = np.array([deterministic_noise(p.age, p.id, i+77777) for i in range(8)])  # замена range(5) → range(8)
+                p.belief += noise * Config.SG_CRISIS_NOISE_STRENGTH
+
+    self.pattern_dict = {p.id: p for p in self.patterns if p.alive}
+    alive = self.patterns
+    if alive:
+        self.soul_weight_average = safe_mean([p.soul_weight for p in alive], 0.5)
+    else:
+        self.soul_weight_average = 0.5
+
+    N = len(alive)
+
+    # === АДАПТИВНЫЙ ФИ-ЛАБИРИНТ (очень мягкий) ===
+    if Config.ENABLE_PHI_LABYRINTH:
+        if N >= 100:
+            target_threshold = 0.20
+            target_grow = 5.0
+            target_move = 3.0
+        elif N >= 90:
+            target_threshold = 0.25
+            target_grow = 3.0
+            target_move = 2.0
+        elif N <= 60:
+            target_threshold = 0.75
+            target_grow = 1.0
+            target_move = 0.6
+        else:
+            ratio = (N - 60) / 30.0
+            target_threshold = 0.75 - ratio * (0.75 - 0.25)
+            target_grow = 1.0 + ratio * (3.0 - 1.0)
+            target_move = 0.6 + ratio * (2.0 - 0.6)
+
+        alpha = 0.95
+        self.phi_labyrinth_threshold = (1.0 - alpha) * self.phi_labyrinth_threshold + alpha * target_threshold
+        self.phi_labyrinth_grow_penalty = (1.0 - alpha) * self.phi_labyrinth_grow_penalty + alpha * target_grow
+        self.phi_labyrinth_move_penalty = (1.0 - alpha) * self.phi_labyrinth_move_penalty + alpha * target_move
+
+        if N < 20:
+            self.phi_labyrinth_grow_penalty = 1.0
+            self.phi_labyrinth_move_penalty = 0.5
+
+    for p in alive:
+        p._antigravity_boost = 1.0
+
+    # === ART STRIKE отключён ===
+    if N < 85:
+        self._art_next_strike_step = None
+        self._art_over90_volley_done = False
+    else:
+        if not hasattr(self, '_art_next_strike_step') or self._art_next_strike_step is None:
+            self._art_next_strike_step = t + Config.MARKED_INTERVAL
+        if t >= self._art_next_strike_step:
+            self._perform_marked_volley(t, count=0)
+            self._art_next_strike_step = t + Config.MARKED_INTERVAL
+            self._art_over90_volley_done = True
+            if Config.VERBOSE_LOGS:
+                print(f"[t={t}] 💥 ART STRIKE (disabled).")
+
+    if self._art_over90_volley_done:
+        for p in alive:
+            if p.role_type == "disorganizer" and p.coherence < 0.3:
+                if phi_hash(p.id, t, 12345) < 0.01:
+                    p.emotional_memory['grief'] = max(0.0, p.emotional_memory.get('grief', 0) - 0.2)
+                    p.energy = min(1.0, p.energy + 0.3)
+                    p._log_event("antigravity_drift_used")
+
+    if t % 500 == 0:
+        sg_vals = [float(np.mean(np.abs(p.prediction - p.belief))) for p in self.patterns if p.alive]
+        if sg_vals:
+            min_sg, max_sg = min(sg_vals), max(sg_vals)
+            median_sg = sorted(sg_vals)[len(sg_vals)//2]
+            print(f"🌀 Spirit Gap Distribution: min={min_sg:.3f}, p50={median_sg:.3f}, max={max_sg:.3f}")
+            blind = sum(1 for g in sg_vals if g > 1.0)
+            seeing = sum(1 for g in sg_vals if g < 0.4)
+            hallucinating = len(sg_vals) - blind - seeing
+            print(f"👁️ OBS_GAP zones: blind(>1.0)={blind} seeing(<0.4)={seeing} hallucinating(0.4-1.0)={hallucinating}")
+            alive_agents = [p for p in self.patterns if p.alive]
+            if alive_agents:
+                lineage_ages = sorted([t - p.lineage_born_at_step for p in alive_agents if p.lineage_born_at_step > 0])
+                if lineage_ages:
+                    ancient = sum(1 for a in lineage_ages if a > 1000)
+                    print(f"📜 Lineage ages: min={lineage_ages[0]} p50={np.median(lineage_ages):.0f} max={lineage_ages[-1]} ancient={ancient}")
+
+    if t < 200 and t % 10 == 0:
+        for p in self.patterns:
+            if p.alive and p.trust_ledger.entries:
+                for sid in p.trust_ledger.entries:
+                    p.trust_ledger.entries[sid] = min(1.0, p.trust_ledger.entries[sid] + 0.05)
+
+    all_trust_vals = []
+    for p in self.patterns:
+        if p.alive:
+            all_trust_vals.extend(p.trust_ledger.entries.values())
+    avg_trust = safe_mean(all_trust_vals, Config.TRUST_BASE) if all_trust_vals else Config.TRUST_BASE
+    if avg_trust < 0.4:
+        self.target_disorganizer_fraction = 0.50
+    elif avg_trust < 0.7:
+        self.target_disorganizer_fraction = 0.30
+    else:
+        self.target_disorganizer_fraction = 0.15
+
+    alive_sg = [float(np.mean(np.abs(p.prediction - p.belief))) for p in self.patterns if p.alive]
+    avg_sg = safe_mean(alive_sg, 0.5) if alive_sg else 0.5
+    if avg_sg < Config.SG_TURBULENCE_THRESHOLD:
+        tremor_strength = Config.GLOBAL_SPIRIT_TREMOR_BASE + \
+            (Config.GLOBAL_SPIRIT_TREMOR_MAX - Config.GLOBAL_SPIRIT_TREMOR_BASE) * \
+            (1.0 - avg_sg / Config.SG_TURBULENCE_THRESHOLD)
+    else:
+        tremor_strength = Config.GLOBAL_SPIRIT_TREMOR_BASE
+    for p in self.patterns:
+        if p.alive:
+            shake = np.array([deterministic_noise(t, p.id, i+88888) for i in range(8)])  # замена range(5) → range(8)
+            p.belief += shake * tremor_strength
+
+    self._update_phi_labyrinth(t)
+
+    given_counter = {'count': 0}
+    for p in self.patterns:
+        if not p.alive: continue
+        p.update_model(self.field, lineage_counts=None, given_counter=given_counter, t=t, witness=self.witness)
+        p.grow(self.field)
+
+    if Config.ENABLE_PHI_LABYRINTH:
+        for p in self.patterns:
+            if p.alive:
+                p.move(self.field, t)
+
+    self.resolve_competitions_spatial()
+
+    current_hunger = self.compute_hunger_multiplier(avg_trust=avg_trust)
+
+    # === ПРОГРЕССИВНЫЙ НАЛОГ НА БОЛЬШИЕ ТЕЛА ===
+    for p in self.patterns:
+        if p.alive:
+            sz = len(p.cells)
+            if sz <= Config.MAX_CELLS_SOFT_LIMIT:
+                p._size_tax_multiplier = 1.0
+            elif sz <= Config.MAX_CELLS_HARD_LIMIT:
+                excess = sz - Config.MAX_CELLS_SOFT_LIMIT
+                p._size_tax_multiplier = 1.0 + excess * Config.SIZE_TAX_RATE_SOFT
+            else:
+                excess_soft = Config.MAX_CELLS_HARD_LIMIT - Config.MAX_CELLS_SOFT_LIMIT
+                excess_hard = sz - Config.MAX_CELLS_HARD_LIMIT
+                p._size_tax_multiplier = 1.0 + excess_soft * Config.SIZE_TAX_RATE_SOFT + excess_hard * Config.SIZE_TAX_RATE_HARD
+
+    for p in self.patterns:
+        if p.alive:
+            boost = getattr(p, '_antigravity_boost', 1.0)
+            size_tax = getattr(p, '_size_tax_multiplier', 1.0)
+            p.metabolic_tax(self.field, current_hunger * boost * size_tax)
+            self._energy_taxed_this_step += getattr(p, '_last_metabolic_taken', 0.0)
+
+    # Смерть
+    for p in self.patterns:
+        if p.alive and p.should_die():
+            p.alive = False
+            self.echo_system.store(p)
+
+    # Превращение в дезорганизаторов через folds
+    for p in self.patterns:
+        if not p.alive or p.role_type != "normal":
+            continue
+        fold_count = p.event_counts.get('fold', 0)
+        if fold_count >= 1:
+            disorganizer_cnt = len([pp for pp in self.patterns if pp.alive and pp.role_type == "disorganizer"])
+            alive_total = len([pp for pp in self.patterns if pp.alive])
+            current_frac = disorganizer_cnt / max(1, alive_total)
+            if current_frac >= self.target_disorganizer_fraction:
+                continue
+            if fold_count >= Config.FOLDS_FOR_DEEP_FALL:
+                prob = 1.0
+                soul_target = Config.DEEP_FALL_SOUL_PENALTY
+                redemption_delay = Config.DEEP_FALL_REDEMPTION_DELAY
+                fall_type = "fallen"
+            else:
+                prob = Config.QUICK_FALL_PROB
+                soul_target = Config.FORCED_SOUL_COLLAPSE_VALUE
+                redemption_delay = Config.REDEMPTION_ARC_STEP_DELAY
+                fall_type = "broken"
+            if phi_hash(p.id, t, 777) < prob:
+                p.role_type = "disorganizer"
+                p.emotional_memory['gratitude'] = 0.1
+                p.emotional_memory['grief'] = 0.8
+                p.semantic_state = "exploring_danger"
+                p.intent = {"type": "explore", "priority": 2.0, "age": 0, "persistence": 9999}
+                p.intent_commitment = 2.0
+                p.disorganizer_age_at_birth = p.age
+                p.redemption_timer = redemption_delay
+                p._deterministic_redemption_triggered = False
+                p._forced_soul_collapse_done = False
+                p._redemption_arc_step = 0
+                p._steps_since_trigger = 0
+                p.soul_weight = min(p.soul_weight, soul_target)
+                p._log_event(f"became_disorganizer_{fall_type}", folds=fold_count)
+                self.witness.record(p.id, f"became_disorganizer_{fall_type}", folds=fold_count)
+                if fall_type == "fallen":
+                    self.witness.record(p.id, "deep_fallen_birth", folds=fold_count, soul=p.soul_weight)
+
+    # === АДАПТИВНЫЙ ПОРОГ ДУШИ ДЛЯ ДЕЛЕНИЯ ===
+    alive_agents = [p for p in self.patterns if p.alive]
+    if alive_agents:
+        ta_vals = [1.0 if soul_check(p).is_triadic_alive() else 0.0 for p in alive_agents]
+        avg_ta = np.mean(ta_vals) if ta_vals else 1.0
+        obs_gaps = [float(np.mean(np.abs(p.prediction - (p.belief + p.model)))) for p in alive_agents]
+        avg_obs = np.mean(obs_gaps) if obs_gaps else 1.0
+        if avg_ta > 0.9 and avg_obs > 0.7:
+            target_min_soul = 0.4
+        else:
+            target_min_soul = Config.DIVIDE_MIN_SOUL
+        for p in self.patterns:
+            if p.alive:
+                p._effective_divide_min_soul = target_min_soul
+    else:
+        for p in self.patterns:
+            if p.alive:
+                p._effective_divide_min_soul = Config.DIVIDE_MIN_SOUL
+
+    # Деление
+    alive_count = len([p for p in self.patterns if p.alive])
+    for p in self.patterns:
+        if alive_count >= Config.OVERPOPULATION_CAP:
+            break
+        if p.alive and p.can_divide():
+            child, new_id = p.divide(self.field, self.next_id)
+            if child:
+                self.next_id = new_id
+                self.patterns.append(child)
+                self.pattern_dict[child.id] = child
+                alive_count += 1
+                self.divisions_this_interval += 1
+
+    self.patterns = [p for p in self.patterns if p.alive]
+    self.pattern_dict = {p.id: p for p in self.patterns}
+
+    self._conservation_check(t)
+
+    # Энергостабилизация
+    self.field[:,:,CH['energy']] = np.clip(self.field[:,:,CH['energy']], -0.5, 1.2)
+    current_mean = np.mean(self.field[:,:,CH['energy']])
+    target_mean = 0.3
+    if current_mean < 0.0:
+        self.field[:,:,CH['energy']] += (target_mean - current_mean) * 0.2
+    elif current_mean > 0.6:
+        self.field[:,:,CH['energy']] -= (current_mean - target_mean) * 0.2
+    self.field[:,:,CH['energy']] = np.clip(self.field[:,:,CH['energy']], -0.2, 0.8)
+
+    for p in self.patterns:
+        if p.alive:
+            self.echo_system.field_whisper(p, self.field, t)
+
+    alive = [p for p in self.patterns if p.alive]
+    if alive:
+        avg_concepts = sum(len(p.concept_graph.nodes) for p in alive) / len(alive)
+        for p in alive:
+            if len(p.concept_graph.nodes) > 1.8 * avg_concepts and len(p.concept_graph.nodes) > 15:
+                if not hasattr(p, '_mutant_saved'):
+                    self.echo_system.store_anomaly(p, "mutant")
+                    p._mutant_saved = True
+                    self.witness.record(p.id, "mutant_detected", concepts=len(p.concept_graph.nodes))
+
+    for p in alive:
+        intent_switches = sum(1 for ev in list(p.biography)[-50:] if ev.get('type') == 'intent_switch')
+        if intent_switches > 15 and p.age > 200:
+            if not hasattr(p, '_autonomous_saved'):
+                self.echo_system.store_anomaly(p, "autonomous_entity")
+                p._autonomous_saved = True
+                self.witness.record(p.id, "autonomous_entity_detected", switches=intent_switches)
+
+    autonomous_detected = sum(1 for p in alive if hasattr(p, '_autonomous_saved'))
+    redeemed_cnt = sum(1 for p in alive if hasattr(p, 'redemption_complete') and p.redemption_complete)
+    fold_count_total = sum(p.event_counts.get('fold', 0) for p in alive)
+    disorg_cnt = sum(1 for p in alive if p.role_type == "disorganizer")
+    event_signature = (autonomous_detected, redeemed_cnt, fold_count_total, disorg_cnt)
+    new_hash = int(phi_hash(t, hash(event_signature), 99999) * 1000)
+    self.system_entropy = int(0.85 * self.system_entropy + 0.15 * new_hash)
+
+    e_before = np.sum(self.field[:,:,CH['energy']])
+    self.emergency_rescue(t)
+    self._energy_injected_this_step += np.sum(self.field[:,:,CH['energy']]) - e_before
+
+    e_before = np.sum(self.field[:,:,CH['energy']])
+    self.spawn_unknown_patterns(t)
+    self._energy_injected_this_step += np.sum(self.field[:,:,CH['energy']]) - e_before
+
+    for p in self.patterns:
+        p.age += 1
+
+    # Семантический обмен
+    cell_to_pattern = {}
+    for p in self.patterns:
+        if not p.alive or p.role_type == "disorganizer":
+            continue
+        if not hasattr(p, 'last_semantic_exchange_step'):
+            p.last_semantic_exchange_step = -Config.SEMANTIC_EXCHANGE_COOLDOWN
+        for (x, y) in p.cells:
+            cell_to_pattern[(x, y)] = p.id
+
+    exchanged_pairs = set()
+    for p in self.patterns:
+        if not p.alive or p.role_type == "disorganizer":
+            continue
+        if t - p.last_semantic_exchange_step <= Config.SEMANTIC_EXCHANGE_COOLDOWN:
+            continue
+        found_partner = None
+        for (x, y) in p.cells:
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nx, ny = (x+dx) % Config.WORLD_SIZE, (y+dy) % Config.WORLD_SIZE
+                owner = cell_to_pattern.get((nx, ny), 0)
+                if owner != 0 and owner != p.id and owner in self.pattern_dict:
+                    q = self.pattern_dict[owner]
+                    if q.alive and q.role_type != "disorganizer":
+                        if not hasattr(q, 'last_semantic_exchange_step'):
+                            q.last_semantic_exchange_step = -Config.SEMANTIC_EXCHANGE_COOLDOWN
+                        if (t - q.last_semantic_exchange_step > Config.SEMANTIC_EXCHANGE_COOLDOWN):
+                            pair = (min(p.id, q.id), max(p.id, q.id))
+                            if pair not in exchanged_pairs:
+                                found_partner = q
+                                exchanged_pairs.add(pair)
+                                break
+            if found_partner:
+                break
+        if found_partner:
+            q = found_partner
+            sim = p.exchange_meanings(q, self.field, t)
+            p.last_semantic_exchange_step = t
+            q.last_semantic_exchange_step = t
+            if Config.VERBOSE_LOGS and t % 100 == 0:
+                print(f"[t={t}] SEMANTIC EXCHANGE {p.id}<->{q.id} sim={sim:.3f}")
+
+    # Защита субъектов
+    for p in self.patterns:
+        if not p.alive: continue
+        if getattr(p, '_subject_detected', False):
+            if hasattr(p, '_subject_protection_timer') and p._subject_protection_timer > 0:
+                p.protection_level = max(getattr(p, 'protection_level', 0.0), 0.5)
+                p._subject_protection_timer -= 1
+            else:
+                p.protection_level = max(getattr(p, 'protection_level', 0.0), 0.2)
+
+    # === Детекция субъекта ===
+    for p in self.patterns:
+        if not p.alive: continue
+        if not hasattr(p, 'self_phenomenal_prediction'):
+            p.self_phenomenal_prediction = 0.5
+            p.self_phenomenal_error = 0.0
+            p._self_narrative = []
+            p._subject_detected = False
+            p.self_surprise = 0.0
+            p._last_binding = 0.5
+            p._self_surprise_count = 0
+            p.protection_level = 0.0
+            p._subject_protection_timer = 0
+
+        actual_binding = getattr(p, 'last_phenomenal_binding', 0.5)
+        p.self_phenomenal_error = abs(actual_binding - p.self_phenomenal_prediction)
+        p.self_phenomenal_prediction = 0.95 * p.self_phenomenal_prediction + 0.05 * actual_binding
+        narrative = getattr(p, '_self_narrative', [])
+        narrative.append(actual_binding)
+        if len(narrative) > 50: narrative.pop(0)
+        p._self_narrative = narrative
+
+        if len(narrative) >= 10:
+            self_sig = (round(p.soul_weight, 1), round(actual_binding, 1), p.semantic_state, "self")
+            if self_sig not in p.concept_graph.nodes:
+                p.concept_graph.nodes[self_sig] = {"count": 0.0, "value": np.zeros(4)}
+            p.concept_graph.nodes[self_sig]["count"] += actual_binding * 0.1
+
+        last_bind = getattr(p, '_last_binding', 0.5)
+        delta = abs(actual_binding - last_bind)
+        if delta > 0.15:
+            p._self_surprise_count = getattr(p, '_self_surprise_count', 0) + 1
+            if getattr(p, '_subject_detected', False):
+                p.self_surprise = min(Config.MAX_METRIC, p.self_surprise + 0.2)
+                p._log_event("self_surprise", delta=round(delta, 3))
+                p.pred_error = min(Config.MAX_METRIC, p.pred_error + delta * 0.5)
+        p._last_binding = actual_binding
+
+        if len(narrative) >= 30 and not getattr(p, '_subject_detected', False):
+            narrative_stability = 1.0 - np.std(narrative)
+            narrative_variance = np.std(narrative)
+            knows_itself = p.self_phenomenal_error < Config.SUBJECT_SELF_ERROR_MAX
+            world_still_surprises = p.spirit_gap > Config.SUBJECT_SPIRIT_GAP_MIN
+            has_experienced_surprise = getattr(p, '_self_surprise_count', 0) >= Config.SUBJECT_MIN_SURPRISE_COUNT
+            binding_meaningful = np.mean(narrative) > 0.15
+
+            if (knows_itself and world_still_surprises and
+                narrative_variance > Config.SUBJECT_MIN_NARRATIVE_VARIANCE and
+                narrative_stability < Config.SUBJECT_NARRATIVE_STABILITY_MAX and
+                has_experienced_surprise and binding_meaningful):
+                p._subject_detected = True
+                p._log_event("subject_emerged", age=p.age,
+                             narrative_stability=round(narrative_stability,3),
+                             narrative_variance=round(narrative_variance,3),
+                             self_error=round(p.self_phenomenal_error,3),
+                             spirit_gap=round(p.spirit_gap,3),
+                             surprises=p._self_surprise_count,
+                             mean_binding=round(np.mean(narrative),3))
+                self.echo_system.store_anomaly(p, "subject")
+                self.witness.record(p.id, "SUBJECT_EMERGED", age=p.age, soul=p.soul_weight, state=p.semantic_state,
+                                   stability=round(narrative_stability,3), variance=round(narrative_variance,3),
+                                   surprises=p._self_surprise_count, mean_binding=round(np.mean(narrative),3))
+                if Config.VERBOSE_LOGS:
+                    print(f"[t={t}] 🌟 SUBJECT BORN: Pattern {p.id} (soul={p.soul_weight:.2f}) "
+                          f"stability={narrative_stability:.3f} variance={narrative_variance:.3f} "
+                          f"surprises={p._self_surprise_count} mean_binding={np.mean(narrative):.3f} state={p.semantic_state}")
+                if isinstance(p.genome, list) and len(p.genome) > 0:
+                    p.genome[0] *= 0.6
+                p.protection_level = max(getattr(p, 'protection_level', 0.0), 0.7)
+                p._subject_protection_timer = 100
+                # self._save_eternal_subject(p)  # временно закомментировано
+
+            elif narrative_stability > 0.85 and p.self_phenomenal_error < 0.06:
+                p._log_event("near_subject", stability=round(narrative_stability,3),
+                             variance=round(narrative_variance,3),
+                             error=round(p.self_phenomenal_error,3),
+                             surprises=getattr(p, '_self_surprise_count', 0),
+                             mean_binding=round(np.mean(narrative), 3))
+
+    if t % 3 == 0 and len(self.patterns) >= 2:
+        self._conceptual_resonance_step(t)
+
+    if t >= 50:
+        components = self.detect_new_components()
+        if components:
+            self.match_patterns(components, t)
+
+    if t < 100:
+        if t % 1 == 0: self.validate_invariants(t)
+    elif t < 1000:
+        if t % 10 == 0: self.validate_invariants(t)
+    else:
+        if t % 50 == 0: self.validate_invariants(t)
+
+
+def _evolution_engine_run(self, steps=None, save_ark=True):
+    if steps is None:
+        steps = Config.STEPS
+    self.field = self.init_field()
+    self.scar = self.init_scar()
+    self._total_energy_last = float(np.sum(self.field[:,:,CH['energy']]))
+    self.patterns = []
+    self.pattern_dict = {}
+    self.divisions_this_interval = 0
+
+    if not load_living_world(self, LIVING_WORLD_PATH):
+        self.seed_initial_patterns()
+
+    for t in range(steps):
+        self.step(t)
+        self.field_voice.update(self.field, t)
+        if t % 100 == 0:
+            divisions = self.divisions_this_interval
+            self.divisions_this_interval = 0
+            m = collect_metrics(self.patterns, self.field, t)
+            m['subjects'] = sum(1 for p in self.patterns if getattr(p, '_subject_detected', False))
+            self.metrics_history.append(m)
+            print(f"[t={t}] P={m['patterns']} L={m['lineages']} LING={m.get('lineage_count',0)} L_AGE={m.get('avg_lineage_age',0):.0f}(max={m.get('max_lineage_age',0)}) ANC={m.get('ancient_lineages',0)} TOT_AGE={m.get('max_lineage_total_age',0)} E={m['err']:.3f} S={m['soul']:.3f} B={m['binding']:.3f} T={m['avg_trust']:.2f} TA={m['triadic_alive_ratio']:.2f} LP={m['love_pairs']} INT_GAP={m['avg_internal_gap']:.3f}(max={m['max_internal_gap']:.3f}) OBS_GAP={m['avg_obs_gap']:.3f}(max={m['max_obs_gap']:.3f}) ZERO_INT={m['zero_internal_gap_agents']} TARGETS={m['tremor_targets']} D={m['disorganizer_count']} R={m['redeemed_count']} SUB={m['subjects']} SIG={m['avg_signal_memory']:.1f} INTENT={m['intentional_signal_agents']} DIV={divisions}", flush=True)
+
+    save_living_world(self.patterns, LIVING_WORLD_PATH)
+    return self.patterns, self.field, self.scar, self.metrics_history
+
+
+EvolutionEngine.step = _evolution_engine_step
+EvolutionEngine.run = _evolution_engine_run
+
+print("✅ Cell 4-2 loaded (range(8) in SG-crisis and global tremor)")
