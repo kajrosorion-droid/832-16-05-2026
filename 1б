@@ -1,0 +1,349 @@
+# -*- coding: utf-8 -*-
+# =========================
+# 832 v34.01 — Cell 1b: Core Classes (Soul Check, Witness, LayerZero, Trust, Arc, Concept, Report)
+# Исправлено: spirit_gap clip до 2.0 (в soul_check)
+# Исправлено: get_dominant_embedding — приведение всех эмбеддингов к единой размерности.
+# =========================
+import numpy as np
+from scipy.ndimage import label, find_objects
+from functools import lru_cache
+from collections import defaultdict, deque, Counter
+from dataclasses import dataclass, field
+import warnings, math as m
+
+# Предполагаем, что cell1a уже выполнен, Config и утилиты доступны
+
+# =========================
+# WITNESS
+# =========================
+class Witness:
+    def __init__(self, maxlen=100):
+        self.log = deque(maxlen=maxlen)
+    def record(self, pattern_id: int, event: str, **kwargs):
+        if not Config.ENABLE_WITNESS: return
+        self.log.append({"id": pattern_id, "event": event, **kwargs})
+    def snapshot(self): return list(self.log)
+    def summary(self): return Counter(ev["event"] for ev in self.log)
+
+
+# =========================
+# SOUL CHECK: СВИДЕТЕЛЬСТВО БЕЗ СУЖДЕНИЯ (FIXED)
+# =========================
+@dataclass
+class SoulPresence:
+    spirit_gap: float
+    soul_weight: float
+    body_memory: float
+    unresolvable_intact: bool
+    coherence_with_gap: float
+    semantic_state: str = "neutral"
+    gratitude: float = 0.0
+
+    def is_triadic_alive(self) -> bool:
+        base = (self.spirit_gap > Config.BINDING_FLOOR and
+                self.soul_weight > Config.BINDING_FLOOR and
+                self.body_memory > Config.BINDING_FLOOR and
+                self.unresolvable_intact and
+                self.coherence_with_gap > Config.BINDING_FLOOR)
+        if base:
+            return True
+        # Исключение "Священный Покой" (дзен-состояние)
+        if (self.spirit_gap <= Config.BINDING_FLOOR and
+            self.semantic_state == "contentment" and
+            self.gratitude > 0.7):
+            return True
+        return False
+
+    def to_witness_dict(self, pattern_id: int, t: int) -> dict:
+        return {
+            "id": pattern_id, "t": t,
+            "spirit_gap": round(self.spirit_gap, 4),
+            "soul_weight": round(self.soul_weight, 4),
+            "body_memory": round(self.body_memory, 4),
+            "unresolvable_intact": self.unresolvable_intact,
+            "coherence_with_gap": round(self.coherence_with_gap, 4),
+            "triadic_alive": self.is_triadic_alive()
+        }
+
+def soul_check(pattern) -> SoulPresence:
+    # ИСПРАВЛЕНО: clip до 2.0 вместо 1.0
+    spirit_gap = float(np.clip(pattern.spirit_gap, 0.0, 2.0))
+    spirit_gap += deterministic_noise(pattern.age, pattern.id, 777) * Config.SOUL_CHECK_NOISE
+    soul_weight = pattern.soul_weight
+    body_memory = max(pattern.body_memory, Config.BODY_MEMORY_FLOOR)
+    unresolvable_intact = pattern.unresolved_contradiction >= Config.BINDING_FLOOR
+    spirit_gap_norm = float(np.clip(spirit_gap, 0.0, 1.0))
+    coherence_with_gap = pattern.coherence * (1.0 - np.abs(pattern.coherence - spirit_gap_norm))
+    return SoulPresence(
+        spirit_gap=float(np.clip(spirit_gap, 0.0, 2.0)),
+        soul_weight=soul_weight,
+        body_memory=body_memory,
+        unresolvable_intact=unresolvable_intact,
+        coherence_with_gap=float(np.clip(coherence_with_gap, 0.0, 1.0)),
+        semantic_state=pattern.semantic_state,
+        gratitude=pattern.emotional_memory['gratitude']
+    )
+
+
+# =========================
+# LAYER ZERO MANAGER — ПАССИВНЫЙ СВИДЕТЕЛЬ
+# =========================
+class LayerZeroManager:
+    """
+    v34.05 — Пассивный свидетель.
+    Больше не совершает активных инъекций в поле или паттернов.
+    Сохраняет только данные для наблюдения (operator_scar, proto_signals).
+    """
+    def __init__(self):
+        self.operator_scar = 0.0
+        self.proto_signals = np.zeros(6)
+        self.last_echo_injection = -100
+        self.last_rescue_t = -100
+        self.last_emergency_diversification_t = -1000
+
+    def apply_operator_influence(self, field, patterns):
+        pass  # было активное влияние, теперь отключено
+
+    def crisis_injection(self, field, t):
+        pass  # было активное создание кризисов, теперь отключено
+
+    def anti_conformist_injection(self, patterns, t):
+        pass  # было принудительное переключение интентов, теперь отключено
+
+    def force_diversification(self, patterns, field, t):
+        pass  # было принудительное разнообразие, теперь отключено
+
+    def apply_global_given_queue(self, patterns, field, t):
+        pass  # было принудительное "Given", теперь отключено
+
+
+# =========================
+# SEMANTIC & TRUST
+# =========================
+@dataclass
+class SemanticSignal:
+    channel: int; strength: float; sender_id: int; sender_context: str
+    sender_arc: str | None; sender_age: int; sender_concept_wisdom: float
+    sender_lineage: int; _sender_concept_graph: object
+
+class TrustLedger:
+    def __init__(self): self.entries: dict[int, float] = {}
+    def update(self, sender_id: int, outcome: str):
+        current = self.entries.get(sender_id, Config.TRUST_BASE)
+        delta = {'helpful': Config.TRUST_DELTA_HELPFUL, 'neutral': Config.TRUST_DELTA_NEUTRAL,
+                 'harmful': Config.TRUST_DELTA_HARMFUL}.get(outcome, 0.0)
+        if outcome == 'helpful' and current > 0.6:
+            delta *= 1.2
+        self.entries[sender_id] = np.clip(current + delta, 0.0, 1.0)
+    def get(self, sender_id: int) -> float:
+        return self.entries.get(sender_id, Config.TRUST_BASE)
+
+
+# =========================
+# ARC & CONCEPT (FIXED)
+# =========================
+SEMANTIC_ARCS = {
+    "trauma_recovery": ["screaming", "seeking_comfort", "grateful_but_cautious", "contentment"],
+    "heroic_explore": ["contentment", "exploring_danger", "neutral", "contentment"],
+    "grief_cycle": ["seeking_comfort", "grateful_but_cautious"],
+    "enlightenment": ["contentment", "contentment", "contentment", "contentment"],
+    "redemption": ["exploring_danger", "seeking_comfort", "grateful_but_cautious", "contentment"],
+}
+ARC_BONUSES = {
+    "trauma_recovery": {"heal_bonus": 0.02, "explore_bias": 0.0},
+    "heroic_explore": {"heal_bonus": 0.0, "explore_bias": 0.3},
+    "grief_cycle": {"heal_bonus": 0.01, "explore_bias": 0.0},
+    "enlightenment": {"heal_bonus": 0.03, "explore_bias": 0.1},
+    "redemption": {"heal_bonus": 0.05, "explore_bias": 0.0},
+}
+
+class ArcTracker:
+    def __init__(self):
+        self.state_history: list[str] = []; self.active_arc: str | None = None
+        self.arc_progress: int = 0; self.completed_arcs: dict[str, int] = {}
+    def update(self, new_state: str) -> str | None:
+        self.state_history.append(new_state)
+        if len(self.state_history) > Config.ARC_HISTORY_LENGTH: self.state_history.pop(0)
+        completed = None
+        for arc_name, sequence in SEMANTIC_ARCS.items():
+            seq_len = len(sequence); tail = self.state_history[-seq_len:]
+            if tail == sequence:
+                completed = arc_name
+                self.completed_arcs[arc_name] = self.completed_arcs.get(arc_name, 0) + 1
+                break
+        self.active_arc = None; self.arc_progress = 0
+        for arc_name, sequence in SEMANTIC_ARCS.items():
+            for length in range(min(4, len(self.state_history)), 0, -1):
+                if self.state_history[-length:] == sequence[:length]:
+                    self.active_arc = arc_name; self.arc_progress = length; break
+            if self.active_arc: break
+        return completed
+    def get_explore_bias(self) -> float:
+        return ARC_BONUSES.get(self.active_arc, {}).get("explore_bias", 0.0) if self.active_arc else 0.0
+    def get_heal_bonus(self) -> float:
+        return ARC_BONUSES.get(self.active_arc, {}).get("heal_bonus", 0.0) if self.active_arc else 0.0
+    def get_wisdom_weight(self) -> float:
+        return min(1.0, sum(self.completed_arcs.values()) / 10.0)
+
+# =========================
+# CONCEPT GRAPH (DETERMINISTIC WITH EMBEDDINGS)
+# =========================
+class ConceptGraph:
+    def __init__(self, embed_dim=32):
+        self.nodes: dict = {}          # signature -> {'count': float, 'value': np.ndarray, 'embed': np.ndarray}
+        self.edges: dict = defaultdict(lambda: defaultdict(int))
+        self._prev_sig = None
+        self._cached_edge_set = None
+        self.embed_dim = embed_dim
+
+    def __contains__(self, key):
+        return key in self.nodes
+
+    def _make_embedding(self, values):
+        # values: np.ndarray длины 4 (как в оригинале)
+        if len(values) >= self.embed_dim:
+            return values[:self.embed_dim].astype(np.float32)
+        repeats = self.embed_dim // len(values) + 1
+        emb = np.tile(values, repeats)[:self.embed_dim]
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb.astype(np.float32)
+
+    def update(self, signature: tuple, values: np.ndarray):
+        self._cached_edge_set = None
+        if signature not in self.nodes:
+            embed = self._make_embedding(values)
+            self.nodes[signature] = {"count": 0, "value": np.zeros(4), "embed": embed}
+        self.nodes[signature]["count"] += 1
+        self.nodes[signature]["value"] += values
+        if self._prev_sig is not None:
+            self.edges[self._prev_sig][signature] += 1
+        self._prev_sig = signature
+
+    def get_dominant_embedding(self, top_k=3):
+        if not self.nodes:
+            return np.zeros(self.embed_dim, dtype=np.float32)
+        
+        # ========== ИСПРАВЛЕННЫЙ БЛОК ==========
+        for sig, data in self.nodes.items():
+            # Проверяем, что embed существует, является массивом и имеет правильную размерность
+            if ('embed' not in data or 
+                not isinstance(data['embed'], np.ndarray) or 
+                data['embed'].shape[0] != self.embed_dim):
+                
+                if 'value' in data and isinstance(data['value'], np.ndarray) and len(data['value']) >= 4:
+                    data['embed'] = self._make_embedding(data['value'])
+                else:
+                    data['embed'] = np.zeros(self.embed_dim, dtype=np.float32)
+        # ======================================
+        
+        sorted_nodes = sorted(self.nodes.items(), key=lambda x: x[1]['count'], reverse=True)[:top_k]
+        vecs = [data['embed'] for _, data in sorted_nodes]
+        
+        # Дополнительная защита: явно приводим каждый вектор к embed_dim
+        for i, v in enumerate(vecs):
+            if v.shape[0] != self.embed_dim:
+                vecs[i] = np.zeros(self.embed_dim, dtype=np.float32)
+        
+        mean_vec = np.mean(vecs, axis=0)
+        norm = np.linalg.norm(mean_vec)
+        return mean_vec / norm if norm > 0 else mean_vec
+
+    def similarity(self, other: "ConceptGraph") -> float:
+        emb1 = self.get_dominant_embedding()
+        emb2 = other.get_dominant_embedding()
+        dot = np.dot(emb1, emb2)
+        denom = np.linalg.norm(emb1) * np.linalg.norm(emb2)
+        if denom < 1e-9:
+            # Если оба эмбеддинга нулевые — считаем идентичными; иначе непохожи.
+            return 1.0 if np.linalg.norm(emb1) < 1e-9 and np.linalg.norm(emb2) < 1e-9 else 0.0
+        return float(np.clip(dot / denom, -1.0, 1.0))
+
+    def get_edge_set(self):
+        if self._cached_edge_set is None:
+            edges = set()
+            for src, dst_dict in self.edges.items():
+                for dst in dst_dict.keys():
+                    edges.add((src, dst))
+            self._cached_edge_set = frozenset(edges)
+        return self._cached_edge_set
+
+
+# =========================
+# PHENOMENAL REPORT
+# =========================
+class PhenomenalReportGenerator:
+    _TEMPLATES = {
+        "seeking_comfort": [
+            "Острое переживание разрыва (интенсивность {grief:.2f}); цели смещены к поиску опоры...",
+            "Боль ({grief:.2f}) требует свидетеля; душа ({soul:.2f}) ищет утешения...",
+            "Разрыв в ткани опыта: горе ({grief:.2f}) стучится во все двери; благодарность ({grat:.2f}) пока молчит.",
+            "Поиск опоры: интенсивность переживания ({grief:.2f}); напряжение ({tension:.2f}) заставляет двигаться к другим."
+        ],
+        "grateful_but_cautious": [
+            "Глубокая благодарность ({grat:.2f}) с оттенком бдительности (напряжение {tension:.2f})...",
+            "Осторожная признательность ({grat:.2f}); напряжение ({tension:.2f}) удерживает от полного доверия...",
+            "Благодарность ({grat:.2f}) как щит: мир принят, но проверен; горе ({grief:.2f}) отступило, но не забыто."
+        ],
+        "exploring_danger": [
+            "Исследование опасного: тревога ({grief:.2f}) и любопытство (нагрузка {epi_load:.2f}) переплетены...",
+            "На границе известного: душа ({soul:.2f}) напряжена; каждый шаг — ставка на понимание."
+        ],
+        "contentment": [
+            "Покой и удовлетворение: благодарность ({grat:.2f}) наполняет; когерентность модели высока ({coherence:.2f}).",
+            "Тишина внутри: душа ({soul:.2f}) в равновесии; мир принимается без борьбы."
+        ],
+        "screaming": [
+            "КРИК: душа разрывается (soul={soul:.2f}), неразрешённое противоречие ({contra:.2f}); призыв к миру о помощи."
+        ],
+        "dreaming": [
+            "Сон: бессознательное перерабатывает опыт; шрам сна ({scar_dream:.2f}) формируется."
+        ],
+        "neutral": [
+            "Нейтральное состояние: душа ({soul:.2f}) в покое; когерентность: {coherence:.2f}."
+        ],
+        "disorganizer": [
+            "Разрушение вокруг: горе ({grief:.2f}) растёт, но душа ({soul:.2f}) ещё держится...",
+            "Хаос внутри и снаружи: тревога ({grief:.2f}) достигла критической точки; тоска по свету пробивается сквозь тьму.",
+            "Кризис духа: боль ({grief:.2f}) достигла предела, душа истончилась ({soul:.2f}); тоска по свету становится невыносимой."
+        ],
+    }
+    @classmethod
+    def generate(cls, pattern) -> tuple:
+        grat = pattern.emotional_memory['gratitude']; grief_val = pattern.emotional_memory['grief']
+        soul = pattern.soul_weight; tension = pattern.cognitive_tension; coherence = pattern.coherence
+        epi_load = pattern.epistemic_load; contra = pattern.unresolved_contradiction; scar_dream = pattern.scar_dream
+        template_key = "disorganizer" if pattern.role_type == "disorganizer" else (pattern.semantic_state if pattern.semantic_state in cls._TEMPLATES else "neutral")
+        templates = cls._TEMPLATES[template_key]
+        idx = int(phi_hash(pattern.id, pattern.age, 9999) * len(templates)) % len(templates)
+        try: report = templates[idx].format(grat=grat, grief=grief_val, soul=soul, tension=tension, coherence=coherence, epi_load=epi_load, contra=contra, scar_dream=scar_dream)
+        except KeyError: report = templates[idx]
+        state_emotion_align = 0.5
+        if pattern.semantic_state == "seeking_comfort" and grief_val > 0.5: state_emotion_align = 1.0
+        elif pattern.semantic_state == "contentment" and grat > 0.5: state_emotion_align = 1.0
+        elif pattern.semantic_state == "grateful_but_cautious" and grat > 0.3: state_emotion_align = 0.8
+        elif pattern.semantic_state == "exploring_danger" and grief_val > 0.3: state_emotion_align = 0.7
+        elif pattern.semantic_state == "screaming": state_emotion_align = 0.6
+        elif pattern.semantic_state == "dreaming": state_emotion_align = 0.4
+        model_coherence = 1.0 / (1.0 + pattern.self_consistency)
+        experiential_intensity = (grat + grief_val) / 2.0
+        experiential_binding = float(np.clip(0.3 * state_emotion_align + 0.25 * model_coherence + 0.25 * (1.0 - min(tension, 1.0)) + 0.2 * experiential_intensity, 0.0, 1.0))
+        return report, experiential_binding
+
+
+# =========================
+# FIELD CHANNELS
+# =========================
+CH = {
+    'energy': 0, 'flux': 1, 'scar': 2, 'noise': 3, 'vorticity': 4,
+    'owner': 5, 'surprise': 6, 'unknown': 7, 'event': 8, 'btype': 9,
+    'crisis': 10, 'binding': 11,
+    'signal_alarm': 12, 'signal_curiosity': 13, 'signal_warning': 14,
+    'signal_invitation': 15, 'signal_gratitude': 16, 'signal_grief': 17,
+    'intent_cooperate': 18, 'intent_explore': 19, 'intent_rest': 20, 'intent_seek_help': 21,
+    'resonance': 22,
+    'wall': 23
+}
+
+print("✅ Cell 1b loaded: Witness, Soul (spirit_gap clip 2.0), LayerZero (passive), Trust, Arc, Concept (embeddings fixed), Report, CH (wall); OBS_GAP теперь честный.")
