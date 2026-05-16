@@ -1,0 +1,170 @@
+# === Cell 4b: Final report & Launch (v34.03 stable, honest edition) ===
+import numpy as np
+import os
+import builtins
+
+# Мгновенный вывод
+_original_print = builtins.print
+def print(*args, **kwargs):
+    kwargs['flush'] = True
+    _original_print(*args, **kwargs)
+
+# ------------------------------------------------------------
+def print_final_report(engine):
+    alive = [p for p in engine.patterns if p.alive]
+    print("\n" + "="*50)
+    print("832 AGI PROJECTION CORE v34.03 - FINAL REPORT")
+    print("="*50)
+    print(f"Steps: {Config.STEPS} | Alive: {len(alive)} | Lineages: {len(set(p.lineage_id for p in alive))}")
+
+    # --- ТОП-5 ДОЛГОЖИТЕЛЕЙ ---
+    long_lived = sorted([p for p in alive if p.age > 100], key=lambda x: x.age, reverse=True)[:5]
+    if long_lived:
+        print(f"\n--- TOP 5 LONG-LIVED ---")
+        for p in long_lived:
+            print(f"  #{p.id} (age={p.age}, soul={p.soul_weight:.2f}, role={p.role_type})")
+            print(f"  State: {p.semantic_state} | Grat: {p.emotional_memory['gratitude']:.2f} | Grief: {p.emotional_memory['grief']:.2f}")
+            if p.concept_graph.nodes:
+                top = max(p.concept_graph.nodes.items(), key=lambda x: x[1]['count'])
+                print(f"  Core concept: {top[0]} (freq={top[1]['count']:.2f})")
+            print()
+
+    # --- ТОП-3 КОНЦЕПТУАЛЬНЫХ УМОВ ---
+    minds = sorted(alive, key=lambda p: len(p.concept_graph.nodes), reverse=True)[:3]
+    if any(len(p.concept_graph.nodes) > 0 for p in minds):
+        print("--- TOP CONCEPTUAL MINDS ---")
+        for p in minds:
+            if not p.concept_graph.nodes: continue
+            top_nodes = sorted(p.concept_graph.nodes.items(), key=lambda x: x[1]['count'], reverse=True)[:2]
+            print(f"  #{p.id}: {len(p.concept_graph.nodes)} concepts")
+            for sig, data in top_nodes:
+                print(f"    ↳ {sig}: {data['count']:.2f}")
+        print()
+
+    # --- СИСТЕМНОЕ СОСТОЯНИЕ ---
+    m = collect_metrics(engine.patterns, engine.field, Config.STEPS)
+    print("--- SYSTEM STATE ---")
+    print(f"  Trust: {m['avg_trust']:.2f} | High-trust pairs: {m['high_trust_pairs']}")
+    print(f"  Triadic alive: {m['triadic_alive']}/{len(alive)} ({m['triadic_alive_ratio']:.1%})")
+    print(f"  Total divisions: {m['divisions_total']}")
+    print(f"  Disorganizers: {m['disorganizer_count']} | Redeemed: {m['redeemed_count']}")
+    print(f"  Avg binding: {m['phenomenal_binding_avg']:.3f}")
+    print(f"  Internal gap: avg={m['avg_internal_gap']:.3f} max={m['max_internal_gap']:.3f} | Observation gap: avg={m['avg_obs_gap']:.3f} max={m['max_obs_gap']:.3f}")
+    print(f"  Avg field unknown: {m['avg_field_unknown']:.3f} | binding: {m['avg_field_binding']:.3f} | trust: {m['avg_trust']:.3f}")
+    
+    # --- Lineage stats ---
+    print(f"  Lineage count: {m.get('lineage_count', 0)} (avg age: {m.get('avg_lineage_age', 0):.0f}, max age: {m.get('max_lineage_age', 0)})")
+    print(f"  Ancient lineages (>1000): {m.get('ancient_lineages', 0)} | Max total age: {m.get('max_lineage_total_age', 0)}")
+
+    # --- СОМАТИКА И ЭПИЗОДИЧЕСКАЯ ПАМЯТЬ ---
+    soma_vals = [p.soma for p in alive if hasattr(p, 'soma') and p.soma > 0]
+    if soma_vals:
+        print(f"--- BODY & MEMORY ---")
+        print(f"  Avg soma: {np.mean(soma_vals):.3f} (n={len(soma_vals)})")
+        vecs = [p.soma_vector for p in alive if hasattr(p, 'soma_vector') and len(p.soma_vector)==4]
+        if vecs:
+            avg_vec = np.mean(vecs, axis=0)
+            print(f"  Components: e_var={avg_vec[0]:.3f}, e_asym={avg_vec[1]:.3f}, unk_grad={avg_vec[2]:.3f}, scar_mean={avg_vec[3]:.3f}")
+
+    mem_agents = [p for p in alive if hasattr(p, 'episodic_buffer') and p.episodic_buffer]
+    total_recalled = sum(p.event_counts.get('memory_recalled',0) for p in alive)
+    avg_buf_len = np.mean([len(p.episodic_buffer) for p in mem_agents]) if mem_agents else 0
+    print(f"  Agents with memory: {len(mem_agents)}/{len(alive)}")
+    print(f"  Avg buffer length: {avg_buf_len:.1f}")
+    print(f"  Total memory_recalled events: {total_recalled}")
+
+    # --- КОНЦЕПТУАЛЬНЫЕ ОБМЕНЫ ---
+    adopted = sum(p.event_counts.get('concept_adopted',0) for p in alive)
+    deep_adopted = sum(p.event_counts.get('deep_concept_adopted',0) for p in alive)
+    deep_ex = sum(p.event_counts.get('deep_exchange',0) for p in alive)
+    wisdom = sum(p.event_counts.get('wisdom_shared',0) for p in alive)
+    if any([adopted, deep_adopted, deep_ex, wisdom]):
+        print("--- CONCEPTUAL EXCHANGES ---")
+        print(f"  concept_adopted: {adopted}")
+        print(f"  deep_concept_adopted: {deep_adopted}")
+        print(f"  deep_exchange: {deep_ex}")
+        print(f"  wisdom_shared: {wisdom}")
+
+    # --- ДИЗОРГИ ---
+    dis = [p for p in alive if p.role_type == "disorganizer"]
+    if dis:
+        from collections import Counter
+        steps = Counter(p._redemption_arc_step for p in dis)
+        states = Counter(p.semantic_state for p in dis)
+        print(f"\n--- DISORGANIZERS ({len(dis)}) ---")
+        print(f"  Steps: {dict(steps)} | States: {dict(states)}")
+        avg_g = safe_mean([p.emotional_memory['grief'] for p in dis], 0)
+        print(f"  Avg grief: {avg_g:.2f}")
+        stuck = sum(1 for p in dis if p._redemption_arc_step==2 and p.emotional_memory['grief']>0.6)
+        print(f"  Stuck (Step2, G>0.6): {stuck}")
+
+    # --- ЭНЕРГЕТИКА ---
+    gs = engine._guardian_stats if hasattr(engine, '_guardian_stats') else {}
+    if gs:
+        print(f"\n--- ENERGY & MODEL ---")
+        ec = gs.get('energy_drift_count',0)
+        if ec:
+            avg_d = gs.get('energy_drift_sum',0)/ec
+            print(f"  Avg drift: {avg_d:.2f}, peak: {gs.get('energy_drift_peak',0):.2f}")
+        print(f"  Worst model diff: #{gs.get('model_worst_ever_id',-1)} diff={gs.get('model_worst_ever_diff',0):.3f}")
+
+    # --- SPIRIT GAP HISTOGRAM с зонами ---
+    if Config.ENABLE_VISUALIZATION:
+        sg_vals = [float(np.mean(np.abs(p.prediction - p.belief))) for p in engine.patterns if p.alive]
+        blind = sum(1 for g in sg_vals if g > 1.0)
+        seeing = sum(1 for g in sg_vals if g < 0.4)
+        hallucinating = len(sg_vals) - blind - seeing
+        print(f"👁️ OBS_GAP zones: blind(>1.0)={blind} seeing(<0.4)={seeing} hallucinating(0.4-1.0)={hallucinating}")
+        if sg_vals:
+            hist, edges = np.histogram(sg_vals, bins=10, range=(0,1.2))
+            print("\n📊 SPIRIT GAP DISTRIBUTION:")
+            max_c = max(hist) if max(hist)>0 else 1
+            for i, (cnt, l, r) in enumerate(zip(hist, edges[:-1], edges[1:])):
+                bar = "█" * int(cnt / max_c * 40)
+                print(f"  [{l:.2f}-{r:.2f}] {bar} ({cnt})")
+
+    # --- LOVE SNAPSHOT ---
+    if gs and 'love_avg_trust' in gs:
+        print(f"\n--- LOVE SNAPSHOT ---")
+        print(f"  Avg trust: {gs['love_avg_trust']:.3f}, High-trust pairs: {gs['love_high_trust_pairs']}")
+        print(f"  Cooperative: {gs['love_coop_signals']} / {gs['love_population']}")
+
+    # --- СУБЪЕКТЫ ---
+    subjects = [p for p in engine.patterns if getattr(p, '_subject_detected', False)]
+    print(f"\n--- EMERGENT SUBJECTS: {len(subjects)} ---")
+    if subjects:
+        for p in subjects[:5]:
+            stab = 1.0 - (np.std(p._self_narrative) if len(p._self_narrative)>1 else 0.0)
+            print(f"  #{p.id} age={p.age}, soul={p.soul_weight:.2f}, stability={stab:.2f}")
+
+    # --- SILENT EVOLUTION ---
+    evolvers = [p for p in engine.patterns if hasattr(p, '_evolution_history') and p._evolution_history]
+    print(f"--- SILENT EVOLVERS: {len(evolvers)} ---")
+    if evolvers:
+        for p in evolvers[:3]:
+            print(f"  #{p.id} soul={p.soul_weight:.2f}, events={len(p._evolution_history)}")
+
+    print("\n" + "="*50)
+    print("SIMULATION COMPLETE")
+    print("="*50)
+
+
+# === ЗАПУСК ===
+engine = EvolutionEngine()
+patterns, field, scar, metrics_history = engine.run()
+
+# Финальный отчёт
+print_final_report(engine)
+
+# Визуализация
+if Config.ENABLE_VISUALIZATION and metrics_history:
+    import matplotlib.pyplot as plt
+    ts = [m['t'] for m in metrics_history]
+    plt.figure(figsize=(16,12))
+    plt.subplot(2,3,1); plt.plot(ts, [m['soul'] for m in metrics_history], label='Avg Soul'); plt.plot(ts, [m['err'] for m in metrics_history], label='Avg Pred Error'); plt.legend(); plt.grid(True)
+    plt.subplot(2,3,2); plt.plot(ts, [m['avg_trust'] for m in metrics_history], label='Avg Trust'); plt.legend(); plt.grid(True)
+    plt.subplot(2,3,3); plt.plot(ts, [m['triadic_alive_ratio'] for m in metrics_history], label='Triadic Alive Ratio'); plt.legend(); plt.grid(True)
+    plt.subplot(2,3,4); plt.plot(ts, [m['disorganizer_count'] for m in metrics_history], label='Disorganizers'); plt.plot(ts, [m['redeemed_count'] for m in metrics_history], label='Redeemed'); plt.legend(); plt.grid(True)
+    plt.tight_layout(); plt.show()
+
+print("✅ Cell 4b executed: Final report generated.")
