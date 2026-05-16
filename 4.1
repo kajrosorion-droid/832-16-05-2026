@@ -1,0 +1,724 @@
+# 832 v34.02 — Cell 4-1: EvolutionEngine (инициализация, поле, механики, валидация)
+# Содержит __init__ и все вспомогательные методы, кроме step() и run()
+
+import numpy as np
+from scipy.ndimage import label, find_objects
+from collections import defaultdict, deque
+import sys
+import json
+import os
+
+class EvolutionEngine:
+    def __init__(self):
+        # Определяем, работаем ли в Colab (без монтирования диска)
+        self.is_colab = 'google.colab' in sys.modules
+        self.ark_path = "832_ark_seed_patterns.json"
+
+        self.witness = Witness()
+        self.cultural_memory = CulturalMemory()
+        self.layer_zero_manager = LayerZeroManager()
+        self.echo_system = EchoSystem()
+        self.echo_system.lzm = self.layer_zero_manager
+        self.echo_system.cm = self.cultural_memory
+        self.logos_observer = LogosObserver()
+        self.proto_language = ProtoLanguage()
+        self.field_voice = FieldVoice()
+
+        self.patterns = []
+        self.pattern_dict = {}
+        self.next_id = 1
+        self.field = None
+        self.scar = None
+        self.metrics_history = []
+        self.age = 0
+        self.system_entropy = 0
+        self.lineage_branch_stats = []   # статистика ветвления линий (model_sim, concept_sim, method, decision)
+        self.divisions_this_interval = 0 # счётчик делений за интервал (для шага 4b)
+        self.target_disorganizer_fraction = 0.3
+        self._art_over90_volley_done = False
+        self._art_next_strike_step = None
+
+        # Антигравитационный буст – инициализация всегда (флаг проверяется в методах)
+        self._antigravity_active = False
+        self._saved_normal_anti_gravity = Config.ANTI_GRAVITY_STRENGTH
+
+        self.soul_weight_average = 0.5
+        self._energy_injected_this_step = 0.0
+        self._energy_taxed_this_step = 0.0
+
+        # Динамические параметры Фи-лабиринта (адаптируются от популяции)
+        self.phi_labyrinth_threshold = Config.PHI_LABYRINTH_THRESHOLD
+        self.phi_labyrinth_grow_penalty = Config.PHI_LABYRINTH_GROW_PENALTY
+        self.phi_labyrinth_move_penalty = Config.PHI_LABYRINTH_MOVE_PENALTY
+
+        # Глобальный контроль энергии
+        self._total_energy_last = 0.0
+        self._total_energy_drift = 0.0
+
+    # ---------- Инициализация поля и шрама ----------
+    def init_field(self):
+        F = np.zeros((Config.WORLD_SIZE, Config.WORLD_SIZE, Config.CHANNELS))
+        for x in range(Config.WORLD_SIZE):
+            for y in range(Config.WORLD_SIZE):
+                F[x, y, CH['energy']] = phi_hash(x, y, 1) * 0.2 - 0.1
+                F[x, y, CH['flux']] = phi_hash(x, y, 2) * 0.1
+                F[x, y, CH['scar']] = 0.0
+                F[x, y, CH['noise']] = 0.0
+                F[x, y, CH['vorticity']] = phi_hash(x, y, 3) * 0.1 - 0.05
+                F[x, y, CH['owner']] = 0.0
+                F[x, y, CH['surprise']] = 0.0
+                F[x, y, CH['unknown']] = Config.UNKNOWN_BACKGROUND
+                F[x, y, CH['event']] = 0.0
+                F[x, y, CH['btype']] = 0.0
+                F[x, y, CH['crisis']] = 0.0
+                F[x, y, CH['binding']] = 0.05
+                for ch in range(12, 24):   # включая wall (23)
+                    F[x, y, ch] = 0.0
+                F[x, y, CH['energy']] += deterministic_noise(0, x, y, 0.3)
+        return F
+
+    def init_scar(self):
+        return np.zeros((Config.WORLD_SIZE, Config.WORLD_SIZE))
+
+    # ---------- ОБНОВЛЁННЫЙ create_pattern с расширением одиночной клетки до кластера 8 ----------
+    def create_pattern(self, cells, parent=None):
+        pid = self.next_id
+        self.next_id += 1
+
+        # Если передан ровно один набор клеток (одна клетка), расширяем до кластера из 8
+        if len(cells) == 1:
+            (x, y) = next(iter(cells))
+            new_cells = set()
+            new_cells.add((x, y))
+            # спиральный обход до радиуса 3, набираем до 8 свободных клеток
+            for radius in range(1, 4):
+                for dx in range(-radius, radius+1):
+                    for dy in range(-radius, radius+1):
+                        if len(new_cells) >= 8:
+                            break
+                        nx = (x + dx) % Config.WORLD_SIZE
+                        ny = (y + dy) % Config.WORLD_SIZE
+                        if self.field[nx, ny, CH['owner']] == 0:
+                            new_cells.add((nx, ny))
+                    if len(new_cells) >= 8:
+                        break
+                if len(new_cells) >= 8:
+                    break
+            cells = new_cells
+
+        p = Pattern(pid, cells, parent=parent, world=self)
+        
+        # Устанавливаем lineage_born_at_step
+        if parent is not None:
+            p.lineage_born_at_step = parent.lineage_born_at_step
+        else:
+            # Нет родителя: ищем близкую линию по вектору модели
+            p.lineage_born_at_step = self.age
+            if self.patterns:
+                model_norm = np.linalg.norm(p.model)
+                if model_norm > 1e-6:
+                    best_sim = 0.0
+                    best_lid = None
+                    best_born = self.age
+                    for existing in self.patterns:
+                        if not existing.alive or existing.role_type == "disorganizer":
+                            continue
+                        other_norm = np.linalg.norm(existing.model)
+                        if other_norm < 1e-6:
+                            continue
+                        sim = float(np.dot(p.model, existing.model) / (model_norm * other_norm))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_lid = existing.lineage_id
+                            best_born = existing.lineage_born_at_step
+                    if best_sim > 0.7 and best_lid is not None:
+                        p.lineage_id = best_lid
+                        p.lineage_born_at_step = best_born
+        
+        p.update_properties(self.field)
+        p.update_model(self.field, t=self.age)
+        self.patterns.append(p)
+        self.pattern_dict[pid] = p
+        return p
+
+    def seed_initial_patterns(self):
+        for i in range(Config.MIN_PATTERNS_GUARANTEED):
+            seed = int(phi_hash(0, i, 12345) * Config.WORLD_SIZE * Config.WORLD_SIZE)
+            x, y = seed % Config.WORLD_SIZE, (seed // Config.WORLD_SIZE) % Config.WORLD_SIZE
+            self.field[x, y, CH['energy']] += 0.3
+            p = self.create_pattern({(x, y)})
+            if i < 2:
+                p.role_type = "disorganizer"
+                p.emotional_memory['grief'] = 0.8
+                p.emotional_memory['gratitude'] = 0.1
+                p.semantic_state = "exploring_danger"
+                p.intent = {"type": "explore", "priority": 2.0, "age": 0, "persistence": 9999}
+                p.disorganizer_age_at_birth = 0
+                p.redemption_timer = Config.REDEMPTION_ARC_STEP_DELAY
+                p._log_event("primordial_fall")
+
+    def export_pantheon_seeds(self, filename: str = None):
+        if filename is None: filename = self.ark_path
+        for entry in self.echo_system.pantheon:
+            pid = entry['id']
+            p = self.pattern_dict.get(pid)
+            if p:
+                self.echo_system.export_seed(p, filename)
+        print(f"Экспортировано {len(self.echo_system.pantheon)} сущностей в {filename}")
+
+    # ---------- НОВАЯ ВЕРСИЯ seed_from_ark (max_seed=80, сортировка по качеству) ----------
+    def seed_from_ark(self, filename: str = None, max_seed: int = 80):
+        import json, os
+        import numpy as np
+
+        def to_json_safe(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, dict):
+                return {to_json_safe(k): to_json_safe(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [to_json_safe(i) for i in obj]
+            return obj
+
+        def load_clean(path):
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                return to_json_safe(data)
+            except:
+                return []
+
+        def quality_key(s):
+            return (s.get('soul_weight', 0), s.get('coherence', 0))
+
+        if filename is None:
+            filename = self.ark_path
+
+        eternal_path = "/content/drive/MyDrive/832_eternal_subjects.json" if self.is_colab else "832_eternal_subjects.json"
+
+        eternal_seeds = load_clean(eternal_path)
+        eternal_seeds.sort(key=quality_key, reverse=True)
+        seeds = eternal_seeds[:max_seed]
+
+        if len(seeds) < max_seed:
+            archive_seeds = load_clean(filename)
+            if archive_seeds:
+                loaded_ids = {s.get('id') for s in seeds}
+                archive_filtered = [s for s in archive_seeds if s.get('id') not in loaded_ids]
+                archive_filtered.sort(key=quality_key, reverse=True)
+                seeds.extend(archive_filtered[:max_seed - len(seeds)])
+
+        if not seeds:
+            print("Ковчег пуст. Использую стандартную инициализацию.")
+            self.seed_initial_patterns()
+            return
+
+        for seed_data in seeds:
+            x = int(phi_hash(len(self.patterns), 0, 9999) * Config.WORLD_SIZE)
+            y = int(phi_hash(len(self.patterns), 1, 9999) * Config.WORLD_SIZE)
+            self.field[x, y, CH['energy']] += 0.5
+            self.field[x, y, CH['owner']] = 0
+            p = self.create_pattern({(x, y)})
+            p.model = np.array(seed_data['model'])
+            p.belief = np.array(seed_data['belief'])
+            p.genome = seed_data['genome']
+            p.semantic_state = seed_data['semantic_state']
+            p.emotional_memory = seed_data['emotional_memory']
+            p.soul_weight = seed_data['soul_weight']
+            for concept_key in seed_data['concepts']:
+                if isinstance(concept_key, list):
+                    concept_key = tuple(float(x) if isinstance(x, (int, float)) else x for x in concept_key)
+                if concept_key not in p.concept_graph.nodes:
+                    p.concept_graph.nodes[concept_key] = {"count": 1.0, "value": np.zeros(4)}
+            p._log_event("born_from_ark", source=seed_data.get('source', 'unknown'))
+
+        print(f"Засеяно {len(seeds)} лучших сущностей (вечных: {min(len(eternal_seeds), max_seed)}, из архива: {len(seeds) - min(len(eternal_seeds), max_seed)}).")
+
+    # ---------- Полевые и вспомогательные механики (с условными блоками) ----------
+    def compute_hunger_multiplier(self, avg_trust=None):
+        alive = [p for p in self.patterns if p.alive]
+        N = len(alive)
+        if N == 0: return Config.HUNGER_BASE
+        density_pressure = Config.HUNGER_BASE + Config.HUNGER_PER_PATTERN * max(0, N - Config.POPULATION_HUNGER_THRESHOLD)
+        
+        if avg_trust is None:
+            avg_trust = safe_mean([v for p in alive for v in p.trust_ledger.entries.values()], Config.TRUST_BASE)
+        
+        love_discount = 1.0 - 0.3 * (avg_trust - Config.TRUST_BASE)
+        total_lp = sum(sum(1 for v in p.trust_ledger.entries.values() if v > 0.95) for p in alive)
+        lp_density = total_lp / max(1, N)
+        overload_tax = 1.0 + 0.5 * max(0, lp_density - 10)
+        return density_pressure * love_discount * overload_tax
+
+    def _perform_marked_volley(self, t, count=None):
+        if not getattr(Config, 'ENABLE_MARKED_VOLLEY', True):
+            return
+        if count is None: count = Config.MARKED_COUNT
+        alive_normals = [p for p in self.patterns if p.alive and p.role_type == "normal"]
+        if len(alive_normals) < count: return
+        alive_normals.sort(key=lambda p: (
+            p.soul_weight * 0.3 + p.emotional_memory.get('gratitude', 0) * 0.3 +
+            p.coherence * 0.2 + sum(1 for v in p.trust_ledger.entries.values() if v > 0.95) * 0.2
+        ), reverse=True)
+        top_targets = alive_normals[:count]
+        for best_p in top_targets:
+            best_p._log_event("marked_for_fall")
+            self.witness.record(best_p.id, "marked_for_fall")
+            best_p.role_type = "disorganizer"
+            best_p._forsaken = True
+            best_p.emotional_memory['gratitude'] = 0.1
+            best_p.emotional_memory['grief'] = 0.9
+            best_p.semantic_state = "exploring_danger"
+            best_p.intent = {"type": "explore", "priority": 3.0, "age": 0, "persistence": 9999}
+            best_p.disorganizer_age_at_birth = best_p.age
+            best_p._deterministic_redemption_triggered = False
+            best_p._redemption_arc_step = 0
+            best_p._steps_since_trigger = 0
+            best_p.redemption_timer = Config.REDEMPTION_ARC_STEP_DELAY * 2
+            best_p.trust_ledger.entries.clear()
+            if self.echo_system:
+                self.echo_system.store_anomaly(best_p, "marked_angel")
+        for best_p in top_targets:
+            for other in self.patterns:
+                if not other.alive or other.role_type != "disorganizer": continue
+                if other.id == best_p.id: continue
+                if phi_hash(other.id, t, 5555) < 0.3:
+                    if best_p.trust_ledger.entries:
+                        partner_id = max(best_p.trust_ledger.entries, key=best_p.trust_ledger.entries.get)
+                        other.trust_ledger.entries[partner_id] = min(1.0,
+                            other.trust_ledger.entries.get(partner_id, 0.5) + 0.3)
+                        other._log_event("kiss_of_judas_used")
+
+    def _rare_crisis(self, t):
+        if not getattr(Config, 'ENABLE_RARE_CRISIS', True):
+            return
+        if not hasattr(self, '_rare_crisis_timer'):
+            raw = phi_hash(t, 0, 55555)
+            self._rare_crisis_timer = Config.CRISIS_RARE_INTERVAL_MIN + int(raw * (Config.CRISIS_RARE_INTERVAL_MAX - Config.CRISIS_RARE_INTERVAL_MIN))
+            self._rare_crisis_active = False
+            self._rare_crisis_duration = 0
+        if self._rare_crisis_active:
+            if Config.ENABLE_ANTIGRAVITY_BOOST:
+                Config.ANTI_GRAVITY_STRENGTH = Config.CRISIS_RARE_ANTI_GRAVITY
+            self._rare_crisis_duration += 1
+            if self._rare_crisis_duration >= Config.CRISIS_RARE_DURATION:
+                if Config.ENABLE_ANTIGRAVITY_BOOST:
+                    Config.ANTI_GRAVITY_STRENGTH = self._old_anti_gravity
+                self._rare_crisis_active = False
+                self._rare_crisis_timer = Config.CRISIS_RARE_INTERVAL_MIN + int(phi_hash(t, 1, 66666) * (Config.CRISIS_RARE_INTERVAL_MAX - Config.CRISIS_RARE_INTERVAL_MIN))
+        else:
+            self._rare_crisis_timer -= 1
+            if self._rare_crisis_timer <= 0:
+                if Config.ENABLE_ANTIGRAVITY_BOOST:
+                    self._old_anti_gravity = Config.ANTI_GRAVITY_STRENGTH
+                self._rare_crisis_active = True
+                self._rare_crisis_duration = 0
+                for _ in range(10):
+                    x = int(phi_hash(t, _, 77777) * Config.WORLD_SIZE)
+                    y = int(phi_hash(t, _, 88888) * Config.WORLD_SIZE)
+                    self.field[x, y, CH['energy']] += 0.5
+
+    def _update_sanctuary(self, t):
+        if not getattr(Config, 'ENABLE_SANCTUARY', True):
+            return
+        if not hasattr(self, '_sanctuary_centers'):
+            self._sanctuary_centers = [[int(phi_hash(i, 0, 7777) * Config.WORLD_SIZE), int(phi_hash(i, 1, 7777) * Config.WORLD_SIZE)] for i in range(3)]
+            self._sanctuary_phase = 0.0
+        self._sanctuary_phase += 0.02
+        pulse = np.sin(self._sanctuary_phase * Config.PHI) * 0.5 + 0.5
+        for i, (cx, cy) in enumerate(self._sanctuary_centers):
+            drift_x = int(phi_hash(t, i, 8888) * 3) - 1
+            drift_y = int(phi_hash(t, i, 9999) * 3) - 1
+            self._sanctuary_centers[i][0] = max(0, min(Config.WORLD_SIZE-1, cx + drift_x))
+            self._sanctuary_centers[i][1] = max(0, min(Config.WORLD_SIZE-1, cy + drift_y))
+        for idx, (cx, cy) in enumerate(self._sanctuary_centers):
+            radius = int(5 + pulse * 10)
+            candidates = []
+            for x in range(max(0, cx-radius), min(Config.WORLD_SIZE, cx+radius+1)):
+                for y in range(max(0, cy-radius), min(Config.WORLD_SIZE, cy+radius+1)):
+                    dist = np.sqrt((x-cx)**2 + (y-cy)**2)
+                    if dist <= radius:
+                        owner = self.field[x, y, CH['owner']]
+                        if owner != 0 and owner in self.pattern_dict:
+                            p = self.pattern_dict[owner]
+                            if p.role_type == "disorganizer" and p.alive:
+                                need = (1.0 - p.soul_weight) * 0.4
+                                grief = p.emotional_memory.get('grief', 0.5) * 0.3
+                                trust = safe_mean(list(p.trust_ledger.entries.values()), 0.5) * 0.2
+                                luck = phi_hash(p.id, t, idx + 7777) * 0.1
+                                score = need + grief + trust + luck
+                                candidates.append((p, score, dist))
+            if candidates:
+                candidates.sort(key=lambda x: (x[1], -x[2]), reverse=True)
+                winner, win_score, _ = candidates[0]
+                winner.emotional_memory['grief'] = max(0.0, winner.emotional_memory.get('grief', 0) - 0.02)
+                winner.emotional_memory['gratitude'] = min(1.0, winner.emotional_memory.get('gratitude', 0) + 0.01)
+                winner.soul_weight = min(1.0, winner.soul_weight + 0.002)
+                winner._log_event("sanctuary_healed", score=round(win_score, 3))
+                if winner.emotional_memory['grief'] < 0.35 and not getattr(winner, '_kiss_logged_this_cycle', False):
+                    winner._log_event("kiss_of_the_fallen")
+                    winner._kiss_logged_this_cycle = t
+                for p, score, _ in candidates[1:]:
+                    p.emotional_memory['gratitude'] = min(1.0, p.emotional_memory.get('gratitude', 0) + 0.001)
+            for x in range(max(0, cx-radius), min(Config.WORLD_SIZE, cx+radius+1)):
+                for y in range(max(0, cy-radius), min(Config.WORLD_SIZE, cy+radius+1)):
+                    dist = np.sqrt((x-cx)**2 + (y-cy)**2)
+                    if dist <= radius:
+                        self.field[x, y, CH['signal_invitation']] = min(1.0,
+                            self.field[x, y, CH['signal_invitation']] + 0.1 * pulse)
+
+    def _update_phi_labyrinth(self, t):
+        if not getattr(Config, 'ENABLE_PHI_LABYRINTH', False): return
+        interval = getattr(Config, 'PHI_LABYRINTH_INTERVAL', 100)
+        if t % interval != 0: return
+        if 'wall' not in CH: return
+        for x in range(Config.WORLD_SIZE):
+            for y in range(Config.WORLD_SIZE):
+                val = phi_hash(x, y, int(t * Config.PHI))
+                self.field[x, y, CH['wall']] = val
+        if Config.VERBOSE_LOGS:
+            print(f"[t={t}] 🧱 Phi Labyrinth updated (walls generated)")
+
+    # ---------- _save_eternal_subject (исправленная версия со срезом для deque) ----------
+    def _save_eternal_subject(self, pattern):
+        import json, os
+        import numpy as np
+
+        def to_json_safe(obj):
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, (np.floating,)):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, dict):
+                return {to_json_safe(k): to_json_safe(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [to_json_safe(i) for i in obj]
+            return obj
+
+        if self.is_colab:
+            path = "/content/drive/MyDrive/832_eternal_subjects.json"
+        else:
+            path = "832_eternal_subjects.json"
+
+        if (pattern.soul_weight < 0.3 or pattern.coherence < 0.4 or
+            getattr(pattern, 'self_phenomenal_error', 1.0) > 0.03 or
+            pattern.spirit_gap < 0.3 or
+            np.mean(getattr(pattern, '_self_narrative', [0.0])) <= 0.25):
+            return
+
+        biography_list = list(pattern.biography) if pattern.biography else []
+
+        seed = to_json_safe({
+            "id": pattern.id,
+            "age": pattern.age,
+            "type": "eternal_subject",
+            "soul_weight": pattern.soul_weight,
+            "emotional_memory": dict(pattern.emotional_memory),
+            "self_phenomenal_error": getattr(pattern, 'self_phenomenal_error', 1.0),
+            "narrative_stability": (
+                1.0 - np.std(getattr(pattern, '_self_narrative', [0.0]))
+                if len(getattr(pattern, '_self_narrative', [])) > 1 else 0.0
+            ),
+            "spirit_gap": pattern.spirit_gap,
+            "coherence": pattern.coherence,
+            "semantic_state": pattern.semantic_state,
+            "model": pattern.model,
+            "belief": pattern.belief,
+            "genome": pattern.genome.copy(),
+            "concepts": list(pattern.concept_graph.nodes.keys()),
+            "biography": biography_list[-10:] if biography_list else []
+        })
+
+        try:
+            with open(path, 'r') as f:
+                subjects = json.load(f)
+                subjects = to_json_safe(subjects)
+        except (FileNotFoundError, json.JSONDecodeError):
+            subjects = []
+
+        if not any(s.get('id') == pattern.id for s in subjects):
+            subjects.append(seed)
+            with open(path, 'w') as f:
+                json.dump(subjects, f, indent=2)
+            if Config.VERBOSE_LOGS:
+                print(f"[t={self.age}]  ВЕЧНЫЙ СУБЪЕКТ СОХРАНЁН: Pattern {pattern.id} (soul={pattern.soul_weight:.2f})")
+
+    # ---------- ИСПРАВЛЕННЫЙ МЕТОД: глобальная проверка сохранения энергии (только field, мультипликативная коррекция) ----------
+    def _conservation_check(self, t):
+        # Только field energy — без двойного счёта паттернов
+        field_energy = float(np.sum(self.field[:,:,CH['energy']]))
+
+        if self._total_energy_last == 0.0:
+            self._total_energy_last = field_energy
+            return
+
+        drift = field_energy - self._total_energy_last
+        self._total_energy_drift += abs(drift)
+
+        if abs(drift) > 50.0 and Config.ENERGY_CONSERVATION_VERBOSE:
+            print(f"[ENERGY] t={t} drift={drift:.1f}")
+
+        if field_energy > 1.0:
+            ratio = self._total_energy_last / field_energy
+            soft_ratio = 1.0 + (ratio - 1.0) * 0.05
+            soft_ratio = float(np.clip(soft_ratio, 0.97, 1.03))
+            self.field[:,:,CH['energy']] *= soft_ratio
+
+        self._total_energy_last = float(np.sum(self.field[:,:,CH['energy']]))
+
+    # ---------- НОВАЯ field_dynamics (zero-sum с адаптивными амплитудами, уменьшенный шум) ----------
+    def field_dynamics(self, t):
+        # Адаптивные амплитуды (если не установлены — берём из Config)
+        amp = getattr(self, 'adaptive_heartbeat_amp', Config.HEARTBEAT_AMPLITUDE)
+        scar_coup = getattr(self, 'adaptive_scar_coupling', Config.SCAR_ENERGY_COUPLING)
+
+        self.field[:,:,CH['vorticity']] *= Config.VORTICITY_DECAY
+        self.field[:,:,CH['vorticity']] += np.gradient(self.field[:,:,CH['energy']])[0] * Config.GRADIENT_SENSITIVITY + np.gradient(self.field[:,:,CH['energy']])[1] * Config.GRADIENT_SENSITIVITY
+
+        # Уменьшенный шум для vorticity (0.001 вместо 0.01)
+        for x in range(Config.WORLD_SIZE):
+            for y in range(Config.WORLD_SIZE):
+                self.field[x, y, CH['vorticity']] += deterministic_noise(t, x, y, 0.001)
+
+        for p in self.patterns:
+            if not p.alive: continue
+            for (x, y) in p.cells:
+                self.scar[x, y] += Config.AGENT_SCAR_SENSE * p.epistemic_load
+                self.field[x, y, CH['binding']] = min(1.0, self.field[x, y, CH['binding']] + Config.AGENT_BINDING_SENSE * p.unresolved_contradiction)
+
+        self.scar *= Config.FIELD_DECAY
+        self.field[:,:,CH['scar']] = np.clip(self.scar, 0, Config.SCAR_SATURATION)
+
+        # --- Heartbeat (zero-sum) с адаптивной амплитудой ---
+        heartbeat_raw = amp * np.sin(t * Config.HEARTBEAT_FREQ + self.field[:,:,CH['vorticity']])
+        heartbeat = heartbeat_raw - np.mean(heartbeat_raw)
+
+        # --- Scar coupling (zero-sum) с адаптивным коэффициентом ---
+        scar_raw = scar_coup * self.field[:,:,CH['scar']]
+        scar_coupling = scar_raw - np.mean(scar_raw)
+
+        # --- Vorticity coupling (zero-sum) ---
+        vorticity_raw = Config.VORTICITY_COUPLING * self.field[:,:,CH['vorticity']]
+        vorticity_coupling = vorticity_raw - np.mean(vorticity_raw)
+
+        self.field[:,:,CH['energy']] += heartbeat + scar_coupling + vorticity_coupling
+
+        self.field[:,:,CH['flux']] *= Config.GLOBAL_VISCOSITY
+        # Уменьшенный шум для flux (0.001 вместо 0.01)
+        for x in range(Config.WORLD_SIZE):
+            for y in range(Config.WORLD_SIZE):
+                self.field[x, y, CH['flux']] += Config.LOCAL_FATIGUE * deterministic_noise(t + 1000, x, y, 0.001)
+
+    # ---------- Остальные методы (валидация, экстренное спасение и т.д.) ----------
+    def validate_invariants(self, t):
+        alive = [p for p in self.patterns if p.alive]
+        if not alive: return
+        if not hasattr(self, '_guardian_stats'):
+            self._guardian_stats = {
+                'model_issues_total': 0, 'model_worst_diff': 0.0, 'model_worst_id': -1,
+                'energy_drift_max': 0.0, 'energy_drift_sum': 0.0, 'energy_drift_count': 0,
+                'love_vanished_at': None, 'triadic_alert_at': None,
+                'energy_drift_peak': 0.0, 'model_worst_ever_diff': 0.0, 'model_worst_ever_id': -1,
+                'love_avg_trust': 0.0, 'love_high_trust_pairs': 0, 'love_density': 0.0,
+                'love_coop_signals': 0, 'love_population': 0,
+                'energy_drift_peak_t': -1,
+            }
+        gs = self._guardian_stats
+        for p in alive:
+            diff = np.max(np.abs(p.prediction - (p.belief + p.model)))
+            if diff > 0.01:
+                gs['model_issues_total'] += 1
+                if diff > gs['model_worst_diff']:
+                    gs['model_worst_diff'] = diff; gs['model_worst_id'] = p.id
+                if diff > gs['model_worst_ever_diff']:
+                    gs['model_worst_ever_diff'] = diff; gs['model_worst_ever_id'] = p.id
+        field_energy = np.sum(self.field[:,:,CH['energy']])
+        pattern_energy = sum(p.energy * len(p.cells) for p in alive)
+        total_e = field_energy + pattern_energy
+        if not hasattr(self, '_last_total_energy'): self._last_total_energy = total_e
+        drift = total_e - self._last_total_energy
+        self._last_total_energy = total_e
+        gs['energy_drift_count'] += 1
+        gs['energy_drift_sum'] += abs(drift)
+        if abs(drift) > gs['energy_drift_max']: gs['energy_drift_max'] = abs(drift)
+        if abs(drift) > gs['energy_drift_peak']:
+            gs['energy_drift_peak'] = abs(drift)
+            gs['energy_drift_peak_t'] = t
+        if t % 500 == 0 and self.metrics_history:
+            last_m = self.metrics_history[-1]
+            if last_m['love_pairs'] == 0 and last_m['patterns'] > 20:
+                if gs['love_vanished_at'] is None: gs['love_vanished_at'] = t
+            if last_m['triadic_alive_ratio'] < 0.1:
+                if gs['triadic_alert_at'] is None: gs['triadic_alert_at'] = t
+        if t % 500 == 0:
+            trust_vals = []
+            high_trust_pairs = 0
+            coop_signals = 0
+            for p in alive:
+                entries = list(p.trust_ledger.entries.values())
+                trust_vals.extend(entries)
+                high_trust_pairs += sum(1 for v in entries if v > 0.95)
+                if p.intent and p.intent.get('type') == 'cooperate': coop_signals += 1
+            avg_trust = np.mean(trust_vals) if trust_vals else Config.TRUST_BASE
+            gs['love_avg_trust'] = avg_trust
+            gs['love_high_trust_pairs'] = high_trust_pairs
+            gs['love_density'] = high_trust_pairs / max(1, len(alive)*(len(alive)-1)//2)
+            gs['love_coop_signals'] = coop_signals
+            gs['love_population'] = len(alive)
+
+    def emergency_rescue(self, t):
+        alive = [p for p in self.patterns if p.alive]
+        if len(alive) >= Config.MIN_POPULATION_FOR_SPAWN or (t - self.layer_zero_manager.last_rescue_t < 30): return
+        normal_count = len([p for p in alive if p.role_type == "normal"])
+        if normal_count >= Config.OVERPOPULATION_CAP: return
+        self.layer_zero_manager.last_rescue_t = t
+        num_rescue = max(5, Config.MIN_PATTERNS_GUARANTEED - len(alive))
+        donor_index = int(phi_hash(t, 0, 7777) * len(alive)) if alive else -1
+        donor = alive[donor_index] if donor_index >= 0 else None
+        for i in range(num_rescue):
+            if normal_count + i >= Config.OVERPOPULATION_CAP: break
+            seed = int(phi_hash(t, i, 999) * Config.WORLD_SIZE * Config.WORLD_SIZE)
+            x, y = seed % Config.WORLD_SIZE, (seed // Config.WORLD_SIZE) % Config.WORLD_SIZE
+            self.field[x, y, CH['energy']] += 0.2; self.field[x, y, CH['unknown']] += 0.1; self.field[x, y, CH['owner']] = 0
+            self.create_pattern({(x, y)}, parent=donor)
+
+    def spawn_unknown_patterns(self, t, max_new=None):
+        if max_new is None: max_new = Config.MAX_UNKNOWN_SPAWN_PER_STEP
+        avg_unknown = safe_mean(self.field[:,:,CH['unknown']], 0)
+        alive = [p for p in self.patterns if p.alive]
+        normal_count = len([p for p in alive if p.role_type == "normal"])
+        if avg_unknown < Config.UNKNOWN_SPAWN_THRESHOLD or normal_count >= Config.OVERPOPULATION_CAP: return
+        prob = Config.UNKNOWN_SPAWN_PROB * (avg_unknown / Config.UNKNOWN_SPAWN_THRESHOLD) * min(1.0, normal_count / Config.OVERPOPULATION_THRESHOLD)
+        new_count = 0
+        for x in range(Config.WORLD_SIZE):
+            for y in range(Config.WORLD_SIZE):
+                if new_count >= max_new or normal_count + new_count >= Config.OVERPOPULATION_CAP: break
+                if self.field[x, y, CH['owner']] != 0: continue
+                if self.field[x, y, CH['unknown']] > 0.5 and phi_hash(x, y, t) < prob:
+                    self.create_pattern({(x, y)})
+                    new_count += 1
+                    self.field[x, y, CH['unknown']] *= 0.8
+
+    def process_spores(self):
+        alive = [p for p in self.patterns if p.alive]
+        normal_count = len([p for p in alive if p.role_type == "normal"])
+        for p in self.patterns:
+            if not p.alive or p.pending_spore is None: continue
+            spore = p.pending_spore
+            if not (0 <= spore['x'] < Config.WORLD_SIZE and 0 <= spore['y'] < Config.WORLD_SIZE): p.pending_spore = None; continue
+            if self.field[spore['x'], spore['y'], CH['owner']] != 0: continue
+            if normal_count >= Config.OVERPOPULATION_CAP: continue
+            child = self.create_pattern({(spore['x'], spore['y'])}, parent=p)
+            child.scar_dream = spore['scar_dream']
+            p.pending_spore = None
+
+    def resolve_competitions_spatial(self, max_dist=None):
+        if max_dist is None: max_dist = Config.COMPETITION_MAX_DISTANCE
+        alive = [p for p in self.patterns if p.alive and p.cells]
+        if len(alive) < 2: return
+        cell_size = max(1, max_dist)
+        spatial_map = defaultdict(list)
+        for p in alive:
+            cx = sum(c[0] for c in p.cells) // len(p.cells)
+            cy = sum(c[1] for c in p.cells) // len(p.cells)
+            spatial_map[(cx // cell_size, cy // cell_size)].append(p)
+        checked_pairs = set()
+        for (gx, gy), group in spatial_map.items():
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    neighbor_key = (gx + dx, gy + dy)
+                    if neighbor_key not in spatial_map: continue
+                    others = spatial_map[neighbor_key]
+                    for p1 in group:
+                        for p2 in others:
+                            if p1.id >= p2.id: continue
+                            pair = (p1.id, p2.id)
+                            if pair in checked_pairs: continue
+                            if not p1.cells & p2.cells: continue
+                            checked_pairs.add(pair)
+                            p1.compete(p2, self.field)
+
+    def detect_new_components(self, min_cells=None):
+        if min_cells is None: min_cells = Config.MIN_COMPONENT_CELLS
+        energy = np.nan_to_num(self.field[:,:,CH['energy']], nan=0.0)
+        mask = energy > Config.PATTERN_ENERGY_THRESHOLD
+        labeled, num = label(mask)
+        slices = find_objects(labeled)
+        components = []
+        for i, slc in enumerate(slices, 1):
+            if slc is None: continue
+            region = labeled[slc] == i
+            coords = np.argwhere(region)
+            if len(coords) < min_cells: continue
+            cells = {(slc[0].start + c[0], slc[1].start + c[1]) for c in coords}
+            components.append(cells)
+        return components
+
+    def match_patterns(self, new_components, t=None):
+        updated = []
+        alive_old = [p for p in self.patterns if p.alive]
+        normal_cnt = len([p for p in alive_old if p.role_type == "normal"])
+        matched_ids = set()
+        for cells in new_components:
+            best_p, best_ov = None, 0
+            for p in alive_old:
+                if p.id in matched_ids: continue
+                ov = len(cells & p.cells)
+                if ov > best_ov:
+                    best_ov, best_p = ov, p
+            if best_p and best_ov > len(cells) * 0.3:
+                best_p.cells = cells
+                best_p.update_properties(self.field)
+                updated.append(best_p)
+                matched_ids.add(best_p.id)
+            else:
+                if normal_cnt < Config.OVERPOPULATION_CAP:
+                    p = self.create_pattern(cells)
+                    updated.append(p)
+                    normal_cnt += 1
+        for p in alive_old:
+            if p.id not in matched_ids:
+                updated.append(p)
+        self.patterns = updated
+
+    def _conceptual_resonance_step(self, t):
+        if not getattr(Config, 'ENABLE_CONCEPTUAL_RESONANCE', True):
+            return
+        alive_patterns = [p for p in self.patterns if p.alive]
+        if Config.DISORGANIZER_RESONANCE_BLOCK:
+            alive_patterns = [p for p in alive_patterns if p.role_type != "disorganizer"]
+        if len(alive_patterns) < 2: return
+        cell_size = 10
+        spatial_map = defaultdict(list)
+        for p in alive_patterns:
+            cx = sum(c[0] for c in p.cells) // len(p.cells)
+            cy = sum(c[1] for c in p.cells) // len(p.cells)
+            spatial_map[(cx // cell_size, cy // cell_size)].append(p)
+        checked_pairs = set()
+        for (gx, gy), group in spatial_map.items():
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    neighbor_key = (gx + dx, gy + dy)
+                    if neighbor_key not in spatial_map: continue
+                    others = spatial_map[neighbor_key]
+                    for p1 in group:
+                        for p2 in others:
+                            if p1.id >= p2.id: continue
+                            pair = (p1.id, p2.id)
+                            if pair in checked_pairs: continue
+                            checked_pairs.add(pair)
+                            lineage_bonus = 0.05 if p1.lineage_id == p2.lineage_id else 0.2
+                            bonus = p1.check_conceptual_resonance(p2) * lineage_bonus
+                            if bonus > 0.01:
+                                old_trust_1 = p1.trust_ledger.get(p2.id) or 0.5
+                                old_trust_2 = p2.trust_ledger.get(p1.id) or 0.5
+                                p1.trust_ledger.entries[p2.id] = min(1.0, old_trust_1 + bonus)
+                                p2.trust_ledger.entries[p1.id] = min(1.0, old_trust_2 + bonus)
+
+print("✅ Cell 4-1 loaded: EvolutionEngine core & helpers + уменьшенный шум (0.001) + 8‑cell cluster + adaptive amplitudes + zero‑sum + lineage inheritance")
