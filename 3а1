@@ -1,0 +1,555 @@
+# 832 v34.02 — Cell 3a-1: Pattern (инициализация, жизненный цикл, рост, движение, деление, конкуренция, смерть)
+# Часть 1 из 2. Содержит конструктор и основные методы жизнеобеспечения.
+
+import numpy as np
+from collections import defaultdict, deque
+import math as m
+from scipy.ndimage import convolve   # для векторизованного grow
+
+class Pattern:
+    def __init__(self, pid, cells, parent=None, world=None):
+        self.id = pid
+        self.cells = set(cells)
+        self.energy = 0.3
+        self.vorticity = 0.0
+        self.age = 0
+        self.alive = True
+        self.world = world
+        self.parent_id = parent.id if parent else 0
+        self.lineage_id = parent.lineage_id if parent else pid
+        # Возраст линии: наследуется от родителя или устанавливается при рождении
+        self.lineage_born_at_step = parent.lineage_born_at_step if parent else 0
+        self.generation = parent.generation + 1 if parent else 0
+        self.lineage_age = parent.lineage_age + 1 if parent else 0
+        self.identity = np.array([phi_hash(pid, i, 100) for i in range(8)])
+        self.belief = np.zeros(8)
+        self.prediction = np.zeros(8)
+        self.model = np.zeros(8)
+        self.self_state_prediction = np.array([0.0, 0.0])
+        self.self_model = 0.1                    # скаляр
+        self.self_surprise = Config.MIN_ACTIVE
+        self._prev_energy = 0.0
+        self.spirit_gap = 0.0
+        self.soul_weight = 0.5
+        self.soul_momentum = 0.0
+        self.body_memory = 0.0
+        self.unresolved_contradiction = Config.BINDING_FLOOR
+        if parent:
+            flip = 1 if phi_hash(pid, 888, 0) < 0.2 else 0
+            self.role = (parent.role + flip) % 2
+        else:
+            self.role = 0 if phi_hash(pid, 777, 0) < 0.5 else 1
+        self.unknown_belief = 0.0
+        self.unknown_model = 0.0
+        self.unknown_prediction = 0.0
+        self.epistemic_load = 0.0
+        self.prev_epistemic_load = 0.0
+        self.crisis_memory = min(parent.crisis_memory * 0.8, Config.CRISIS_MEMORY_MAX) if parent else 0.0
+        self.memory_trace = []
+        self.self_consistency = 0.0
+        self.coherence = 1.0
+        self.confidence = 0.0
+        self.given_trigger = False
+        self.given_count = 0
+        self.given_cooldown = 0
+        self.surprise_signal = 0.0
+        self.emotional_memory = {'gratitude': 0.0, 'grief': 0.0}
+        if parent:
+            self.emotional_memory['gratitude'] = parent.emotional_memory['gratitude'] * 0.9
+            self.emotional_memory['grief'] = parent.emotional_memory['grief'] * 0.9
+        self.semantic_memory = {'events': []}
+        self.semantic_state = "neutral"
+        self.in_scream = False
+        self.local_phase = "MODEL"
+        self.dream_timer = int(phi_hash(pid, 0, 777) * 30 + 30)
+        self.dream_interval = int(phi_hash(pid, 1, 777) * 40 + 40)
+        self.dream_duration = 3
+        self.in_dream = False
+        self.dream_progress = 0
+        self.scar_dream = 0.0
+        self.pending_spore = None
+        self.last_speciation_age = -Config.SPECIATION_COOLDOWN * 2
+        self.biography = deque(maxlen=20)   # deque с ограничением
+        self.world_state = np.zeros(8)
+        self.world_model = np.zeros((4, 8))
+        self.last_action = 0
+        self.goals = []
+        self.intent = None
+        self.intent_age = 0
+        self.intent_commitment = 0.0
+        self.concept_graph = ConceptGraph()
+        self.concept_history = []
+        self.epistemic_scar = 0.0
+        self.alarm_level = 0.0
+        self.last_intent_switch_age = -Config.INTENT_SWITCH_COOLDOWN
+        self.protection_level = 1.0
+        self._signal_weight_cache = {}
+        self._last_metabolic_taken = 0.0
+        self.self_phenomenal_error = 1.0
+        self._subject_detected = False
+
+        if parent:
+            self.belief = parent.belief.copy()
+            self.prediction = parent.prediction.copy()
+            self.model = parent.model.copy()
+            self.self_model = parent.self_model
+            self.unknown_belief = parent.unknown_belief
+            self.unknown_model = parent.unknown_model
+            mut_strength = Config.MUTATION_STRENGTH_BASE
+            if world and hasattr(world, '_sg_crisis_active') and world._sg_crisis_active:
+                mut_strength *= Config.SG_CRISIS_MUTATION_BOOST
+            mutation = mut_strength * (phi_hash(pid, 100, 0) - 0.5)
+            self.model += mutation
+            self.pred_error_history = parent.pred_error_history[-10:] if hasattr(parent, 'pred_error_history') and parent.pred_error_history else []
+            self.soul_weight = parent.soul_weight * 0.9
+            self.unresolved_contradiction = parent.unresolved_contradiction * 0.9
+            self.body_memory = parent.body_memory * 0.95
+
+            # Рекурсивный хеш генома с эфиром
+            self.genome = {}
+            GENE_ORDER = ['learning_rate', 'meta_learning_rate', 'metabolic_cost', 'mobility', 'epistemic_strategy']
+            last_gene_result = 1.0
+            for key in GENE_ORDER:
+                key_seed = sum(ord(c) for c in str(key)) % 1000
+                current_context = self.world.system_entropy if self.world else 555
+                shift = phi_hash(pid, key_seed, current_context + int(last_gene_result * 1000)) - 0.5
+                parent_val = parent.genome.get(key, 1.0)
+                raw = parent_val + shift * Config.MUTATION_STRENGTH_BASE * 2
+                self.genome[key] = 0.5 + 1.5 * np.tanh((raw - 0.5) / 0.75)
+                last_gene_result = self.genome[key]
+
+            if parent.concept_graph.nodes:
+                sorted_concepts = sorted(parent.concept_graph.nodes.items(), key=lambda x: x[1]['count'], reverse=True)
+                for concept, data in sorted_concepts[:2]:
+                    self.concept_graph.nodes[concept] = {"count": data['count'] * 0.8, "value": data['value'].copy()}
+        else:
+            for i in range(8):
+                self.model[i] = 0.1 * (phi_hash(pid, i, 1) - 0.5)
+            self.pred_error_history = []
+            self.unknown_belief = 0.0
+            self.unknown_model = 0.1 * (phi_hash(pid, 99, 1) - 0.5)
+            self.self_model = 0.1 * (phi_hash(pid, 101, 1) - 0.5)
+            self.genome = {
+                'learning_rate': Config.MODEL_LEARNING_RATE * (0.8 + 0.4 * phi_hash(pid, 1, 3)),
+                'meta_learning_rate': Config.MODEL_LEARNING_RATE * 0.5 * (0.8 + 0.4 * phi_hash(pid, 2, 3)),
+                'metabolic_cost': 0.005 + 0.005 * phi_hash(pid, 3, 4),
+                'mobility': 0.1 + 0.05 * phi_hash(pid, 4, 5),
+                'epistemic_strategy': phi_hash(pid, 5, 6),
+                'mutation_rate': 1.0
+            }
+        if 'mutation_rate' not in self.genome:
+            self.genome['mutation_rate'] = 1.0
+        self.pred_error = Config.MIN_ACTIVE
+        self.unknown_error = 0.0
+        self.compression = 0.0
+        self.fitness = 0.0
+        self.error_trend = 0.0
+        self.cognitive_tension = Config.MIN_ACTIVE
+        self.event_counts = {}
+        self.semantic_state_age = 0
+        self._prev_semantic_state = "neutral"
+        self.active_arc = None
+        self.arc_tracker = ArcTracker()
+        self.fold_cooldown = 0
+        self.last_divide_age = -Config.DIVIDE_COOLDOWN
+        self.role_type = "normal"
+        self.quarantine_timer = 0
+        self.trust_ledger = TrustLedger()
+        self._incoming_signals: list[SemanticSignal] = []
+        self.last_phenomenal_report = ""
+        self.last_phenomenal_binding = 0.0
+        self._redemption_active = False
+        self._deterministic_redemption_triggered = False
+        self._redemption_arc_step = 0
+        self._steps_since_trigger = 0
+        self._forced_soul_collapse_done = False
+        self.redemption_timer = 0
+        self.disorganizer_age_at_birth = 0
+        self._redemption_stability_timer = 0
+        self.last_speech_t = -Config.SPEAK_COOLDOWN
+        self.current_speech = None
+        self.prev_gap = 0.0
+        self.last_semantic_exchange_step = -100
+
+        self.contact_duration = defaultdict(int)
+        self.last_contact_step = defaultdict(int)
+
+        self.soma = 0.0
+        self.soma_vector = np.zeros(4)
+
+        # Эпизодическая память: увеличена до 200
+        self.episodic_buffer = deque(maxlen=200)
+        self._last_memory_check = 0
+
+        self.prediction = self.belief + self.model
+        self._log_event("birth")
+        if Config.ENABLE_CULTURAL_MEMORY and world and world.cultural_memory:
+            world.cultural_memory.whisper_to_newborn(self)
+
+    # ---------- Вспомогательные методы ----------
+    def _log_event(self, event_type, **kwargs):
+        self.biography.append({'t': self.age, 'type': event_type, **kwargs})
+        self.event_counts[event_type] = self.event_counts.get(event_type, 0) + 1
+
+    def update_properties(self, field):
+        if not self.cells:
+            self.alive = False
+            return
+        self.energy = safe_mean([field[x, y, CH['energy']] for (x, y) in self.cells], 0.1)
+        self.vorticity = safe_mean([field[x, y, CH['vorticity']] for (x, y) in self.cells], 0.0)
+
+    def _get_labyrinth_params(self):
+        if self.world and hasattr(self.world, 'phi_labyrinth_threshold'):
+            return (self.world.phi_labyrinth_threshold,
+                    self.world.phi_labyrinth_grow_penalty,
+                    self.world.phi_labyrinth_move_penalty)
+        return (Config.PHI_LABYRINTH_THRESHOLD,
+                Config.PHI_LABYRINTH_GROW_PENALTY,
+                Config.PHI_LABYRINTH_MOVE_PENALTY)
+
+    # ---------- Векторизованный grow ----------
+    def grow(self, field):
+        if not self.alive or self.pred_error > Config.PRED_ERROR_THRESHOLD or self.in_dream:
+            return
+        mask = (field[:, :, CH['owner']] == self.id).astype(np.float32)
+        kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.float32)
+        neighbor_count = convolve(mask, kernel, mode='wrap')
+        empty = (field[:, :, CH['owner']] == 0).astype(np.float32)
+        score = field[:, :, CH['energy']] * 2.0 + field[:, :, CH['unknown']] * 1.8
+        if Config.ENABLE_PHI_LABYRINTH:
+            _, lab_grow, _ = self._get_labyrinth_params()
+            score -= field[:, :, CH['wall']] * lab_grow * 1.5
+        layer = self._get_layer()
+        penalty = self._get_layer_growth_penalty(layer)
+        intent_bias = 1.5 if (self.intent and self.intent.get("type") == "explore") else 1.0
+        threshold = self.pred_error * (1.5 + self.given_trigger) / intent_bias * penalty
+        new_mask = (score > threshold) & (empty > 0) & (neighbor_count > 0)
+        y_coords, x_coords = np.where(new_mask)
+        new_cells = set(zip(x_coords, y_coords))
+        self.cells.update(new_cells)
+        field[new_mask, CH['owner']] = self.id
+
+    # ---------- Векторизованный move ----------
+    def move(self, field, t):
+        if not self.alive or len(self.cells) == 0:
+            return False
+        is_subject = getattr(self, '_subject_detected', False)
+        mobility = self.genome.get('mobility', 0.1) * (2.0 if is_subject else 1.0)
+        if phi_hash(self.id, t, 12345) > mobility:
+            return False
+        total_energy = 0.0
+        sum_x, sum_y = 0.0, 0.0
+        for (x, y) in self.cells:
+            e = field[x, y, CH['energy']]
+            total_energy += e
+            sum_x += x * e
+            sum_y += y * e
+        if total_energy < 1e-6:
+            cx = sum(c[0] for c in self.cells) // len(self.cells)
+            cy = sum(c[1] for c in self.cells) // len(self.cells)
+        else:
+            cx = int(sum_x / total_energy)
+            cy = int(sum_y / total_energy)
+        _, _, lab_move = self._get_labyrinth_params()
+        best_score = -np.inf
+        best_dx, best_dy = 0, 0
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
+            nx = (cx + dx) % Config.WORLD_SIZE
+            ny = (cy + dy) % Config.WORLD_SIZE
+            if field[nx, ny, CH['owner']] != 0:
+                continue
+            wall = field[nx, ny, CH['wall']]
+            wall_penalty = wall * (lab_move * 0.3 if is_subject else lab_move)
+            score = field[nx, ny, CH['energy']] * 2.0 + field[nx, ny, CH['unknown']] * 1.8 - wall_penalty * 1.5
+            if is_subject and self.spirit_gap > 0.6:
+                score += 0.8
+            if score > best_score:
+                best_score = score
+                best_dx, best_dy = dx, dy
+        if best_score < 0.3:
+            return False
+        cells_list = list(self.cells)
+        idx = int(phi_hash(t, self.id, 999) % len(cells_list))
+        old_cell = cells_list[idx]
+        new_cell = ((old_cell[0] + best_dx) % Config.WORLD_SIZE, (old_cell[1] + best_dy) % Config.WORLD_SIZE)
+        if field[new_cell[0], new_cell[1], CH['owner']] == 0:
+            self.cells.remove(old_cell)
+            self.cells.add(new_cell)
+            field[old_cell[0], old_cell[1], CH['owner']] = 0
+            field[new_cell[0], new_cell[1], CH['owner']] = self.id
+            if is_subject:
+                self._log_event("subject_traveled", to=new_cell)
+            if field[new_cell[0], new_cell[1], CH['wall']] > 0.6 and phi_hash(self.id, t, 777) < Config.PHI_LABYRINTH_BREAK_PROB:
+                field[new_cell[0], new_cell[1], CH['wall']] *= 0.4
+                self._log_event("wall_breached")
+            return True
+        return False
+
+    # ---------- Векторизованный metabolic_tax ----------
+    def metabolic_tax(self, field, hunger_mult=1.0):
+        hunger_mult = max(hunger_mult, 0.1)
+        hunger_mult = min(hunger_mult, 5.0)
+        if self.role_type == "disorganizer":
+            hunger_mult *= 0.5
+        if self.protection_level > 0:
+            hunger_mult *= (1.0 - self.protection_level * 0.8)
+        efficiency = 1.0 / (1.0 + self.pred_error)
+        cost = self.genome['metabolic_cost'] * len(self.cells) * (2.0 - efficiency) * hunger_mult
+        if getattr(self, '_forsaken', False):
+            cost *= 0.8
+        if self.intent and self.intent.get('type') == 'cooperate':
+            cost *= 0.7
+        if self.emotional_memory['grief'] > Config.EMOTIONAL_GRIEF_THRESHOLD:
+            cost *= (1.0 + Config.GRIEF_METABOLIC_PENALTY * (self.emotional_memory['grief'] - Config.EMOTIONAL_GRIEF_THRESHOLD))
+        love_partners = [pid for pid, t in self.trust_ledger.entries.items() if t > Config.LOVE_METABOLIC_THRESHOLD]
+        mutual = False
+        if love_partners and self.world and self.world.pattern_dict:
+            for pid in love_partners:
+                partner = self.world.pattern_dict.get(pid)
+                if partner and partner.trust_ledger.get(self.id) > Config.LOVE_METABOLIC_THRESHOLD:
+                    mutual = True
+                    break
+        if mutual:
+            cost *= (1.0 - Config.LOVE_METABOLIC_BONUS)
+            self.energy += 0.01
+
+        if soul_check(self).is_triadic_alive():
+            cost *= 0.6
+
+        cells_arr = np.array(list(self.cells))
+        if len(cells_arr) == 0:
+            return cost
+        xs, ys = cells_arr[:, 0], cells_arr[:, 1]
+        energy_available = field[xs, ys, CH['energy']].copy()
+        total_available = np.sum(energy_available)
+        if total_available <= 0:
+            return cost
+        taken = np.minimum(energy_available, cost / len(self.cells))
+        self._last_metabolic_taken = np.sum(taken)
+        field[xs, ys, CH['energy']] -= taken
+        cost -= self._last_metabolic_taken
+
+        if self.age >= Config.DIVIDE_MIN_AGE and len(self.cells) >= Config.DIVIDE_MIN_SIZE:
+            self.energy += 0.1
+
+        return max(0.0, cost)
+
+    # ---------- Вспомогательные методы слоёв ----------
+    def _get_layer(self):
+        if self.soul_weight < Config.LAYER_VOID_SOUL_THRESHOLD:
+            return 0
+        if self.emotional_memory['grief'] > Config.LAYER_GRIEF_THRESHOLD:
+            return 1
+        if self.cognitive_tension > Config.LAYER_FEAR_TENSION_THRESHOLD:
+            return 2
+        if self.coherence >= Config.LAYER_ACCEPTANCE_COHERENCE_MIN and self.pred_error < 0.3:
+            return 3
+        if (self.emotional_memory['gratitude'] > Config.LAYER_LIGHT_GRATITUDE_MIN and
+            self.intent and self.intent.get('type') == 'cooperate' and
+            safe_mean(list(self.trust_ledger.entries.values()), 0.0) > Config.LAYER_LIGHT_TRUST_MIN):
+            return 5
+        return 4
+
+    def _get_layer_growth_penalty(self, layer):
+        if layer == 0:
+            return Config.LAYER_VOID_GROWTH_PENALTY
+        if layer == 1:
+            return Config.LAYER_GRIEF_GROWTH_PENALTY
+        if layer == 2:
+            return Config.LAYER_FEAR_GROWTH_PENALTY
+        if layer == 5:
+            return Config.LAYER_LIGHT_GROWTH_BONUS
+        return 1.0
+
+    # ---------- Деление и остальные методы ----------
+    def can_divide(self):
+        adaptive_threshold = Config.DIVIDE_ERROR_THRESHOLD + self.soul_weight * (Config.DIVIDE_MAX_THRESHOLD - Config.DIVIDE_ERROR_THRESHOLD)
+        if self.arc_tracker.completed_arcs:
+            adaptive_threshold *= Config.ARC_DIVIDE_BONUS
+        return (self.pred_error < adaptive_threshold and
+                self.energy > Config.PATTERN_ENERGY_THRESHOLD and
+                len(self.cells) >= Config.DIVIDE_MIN_SIZE * Config.DIVIDE_MIN_CELLS_MULT and
+                self.alive and self.soul_weight > getattr(self, '_effective_divide_min_soul', Config.DIVIDE_MIN_SOUL) and
+                self.age > Config.DIVIDE_MIN_AGE and
+                (self.age - self.last_divide_age) > Config.DIVIDE_COOLDOWN and not self.in_dream)
+
+    def divide(self, field, next_id):
+        cells_list = list(self.cells)
+        xs = [c[0] for c in cells_list]
+        median_x = np.median(xs)
+        child1_cells = {c for c in cells_list if c[0] < median_x}
+        child2_cells = {c for c in cells_list if c[0] >= median_x}
+        min_cells = max(3, Config.DIVIDE_MIN_SIZE)
+        if len(child1_cells) < min_cells or len(child2_cells) < min_cells:
+            return None, next_id
+        self.cells = child1_cells
+        child = Pattern(next_id, child2_cells, parent=self, world=self.world)
+
+        if self.role_type == "disorganizer":
+            child.lineage_id = child.id
+            child.lineage_born_at_step = self.world.age if self.world else self.age
+            child._log_event("lineage_break_disorganizer", parent_lineage=self.lineage_id)
+        else:
+            if self.concept_graph.nodes and child.concept_graph.nodes:
+                sim = self.concept_graph.similarity(child.concept_graph)
+            else:
+                sim = 0.8
+            if sim >= 0.55:
+                child.lineage_id = self.lineage_id
+                child.lineage_born_at_step = self.lineage_born_at_step
+                child._log_event("lineage_continue", sim=round(sim, 3), lineage=self.lineage_id)
+            else:
+                child.lineage_id = child.id
+                child.lineage_born_at_step = self.world.age if self.world else self.age
+                child._log_event("lineage_split", sim=round(sim, 3),
+                                 old_lineage=self.lineage_id, new_lineage=child.id)
+
+        child.role_type = "normal"
+        if self.role_type == "disorganizer":
+            child._log_event("born_from_disorganizer", parent_id=self.id)
+        else:
+            child._log_event("born_from_division", parent_id=self.id)
+        if self.role_type == "disorganizer":
+            child.genome['mutation_rate'] = min(2.0, child.genome.get('mutation_rate', 1.0) * 1.3)
+        if hasattr(self, '_scar_of_light') and self.age > 10000 and self.event_counts.get('redeemed', 0) > 20:
+            ancient_sig = (round(self.soul_weight, 1), round(self.emotional_memory['gratitude'], 1), 0.99, "ancient_wisdom")
+            if ancient_sig not in child.concept_graph.nodes:
+                child.concept_graph.nodes[ancient_sig] = {"count": 5.0, "value": np.zeros(4)}
+                child._log_event("gift_of_the_ancient", donor=self.id)
+        noise = 0.02 * np.array([phi_hash(next_id, i, 200)-0.5 for i in range(8)])
+        child.belief = self.belief + noise
+        child.unknown_belief = self.unknown_belief + 0.02 * (phi_hash(next_id, 99, 200)-0.5)
+        child.self_model = self.self_model + 0.02 * (phi_hash(next_id, 201, 200)-0.5)
+        child.emotional_memory['gratitude'] += (phi_hash(next_id, 0, 300)-0.5) * Config.EMOTIONAL_MUTATION_STRENGTH
+        child.emotional_memory['grief'] += (phi_hash(next_id, 1, 301)-0.5) * Config.EMOTIONAL_MUTATION_STRENGTH
+        self.last_divide_age = self.age
+        child.last_divide_age = 0
+        for sid, trust in self.trust_ledger.entries.items():
+            child.trust_ledger.entries[sid] = (trust + Config.TRUST_BASE) / 2.0
+        child.update_properties(field)
+        child.update_model(field, t=self.world.age if self.world else 0)
+        self.update_properties(field)
+        self.update_model(field, t=self.world.age if self.world else 0)
+        return child, next_id + 1
+
+    def compete(self, other, field):
+        # (без изменений, сохранён оригинальный код)
+        if self.protection_level > 0.5 or other.protection_level > 0.5:
+            return
+        if self.role_type == "disorganizer" and other.role_type == "disorganizer":
+            return
+        if self.role_type == "disorganizer" or other.role_type == "disorganizer":
+            trust_self = 0
+            trust_other = 0
+        else:
+            trust_self = self.trust_ledger.get(other.id)
+            trust_other = other.trust_ledger.get(self.id)
+        if trust_self > 0.8 and trust_other > 0.8:
+            return
+        overlap = self.cells & other.cells
+        if not overlap:
+            return
+        my_power = self.fitness * max(self.energy, 0)
+        other_power = other.fitness * max(other.energy, 0)
+        avg_unk = safe_mean(field[:,:,CH['unknown']], 0.05)
+        if self.role == 1:
+            my_power *= 1.0 + avg_unk
+        else:
+            bonus = 1.0 + max(0, (0.2 - avg_unk)) * 0.8
+            my_power *= bonus * (1.1 if self.local_phase == "MODEL" else 1.0)
+        if other.role == 1:
+            other_power *= 1.0 + avg_unk
+        else:
+            bonus = 1.0 + max(0, (0.2 - avg_unk)) * 0.8
+            other_power *= bonus * (1.1 if other.local_phase == "MODEL" else 1.0)
+        if self.emotional_memory['gratitude'] > Config.EMOTIONAL_GRATITUDE_THRESHOLD:
+            my_power *= (1.0 - Config.GRATITUDE_AGGRESSION_REDUCTION * (self.emotional_memory['gratitude'] - Config.EMOTIONAL_GRATITUDE_THRESHOLD))
+        if other.emotional_memory['gratitude'] > Config.EMOTIONAL_GRATITUDE_THRESHOLD:
+            other_power *= (1.0 - Config.GRATITUDE_AGGRESSION_REDUCTION * (other.emotional_memory['gratitude'] - Config.EMOTIONAL_GRATITUDE_THRESHOLD))
+        if self.role_type == "normal" and other.role_type == "normal":
+            if other.trust_ledger.get(self.id) > 0.7:
+                my_power *= Config.TRUST_COOPERATION_BONUS
+            if self.trust_ledger.get(other.id) > 0.7:
+                other_power *= Config.TRUST_COOPERATION_BONUS
+        if not np.isfinite(my_power):
+            my_power = 0
+        if not np.isfinite(other_power):
+            other_power = 0
+        winner, loser = (self, other) if my_power > other_power else (other, self)
+        cells_lost = 0
+        for cell in overlap.copy():
+            if phi_hash(cell[0], cell[1], self.id) < 0.5:
+                loser.cells.discard(cell)
+                winner.cells.add(cell)
+                field[cell[0], cell[1], CH['owner']] = winner.id
+                winner.soul_weight += 0.01
+                loser.soul_weight -= 0.02
+                cells_lost += 1
+            elif ((loser.unresolved_contradiction > 0.2 and phi_hash(cell[0], cell[1], self.id+999) < 0.2) or
+                  phi_hash(cell[0], cell[1], self.id+777) < 0.05):
+                winner.cells.discard(cell)
+                loser.cells.add(cell)
+                field[cell[0], cell[1], CH['owner']] = loser.id
+                winner.soul_weight -= 0.01
+                loser.soul_weight += 0.03
+        if cells_lost > 0 and loser.alive:
+            loser._log_event("lost_cells_in_competition", lost=cells_lost, opponent=winner.id)
+            if self.role_type == "disorganizer" and other.role_type != "disorganizer":
+                other.trust_ledger.update(self.id, 'harmful')
+                if other.trust_ledger.entries:
+                    target_id = max(other.trust_ledger.entries, key=other.trust_ledger.entries.get)
+                    other.trust_ledger.entries[target_id] = max(0.0, other.trust_ledger.entries[target_id] - Config.DISORGANIZER_TRUST_DECAY_RATE)
+
+    def should_die(self):
+        if self.role_type == "disorganizer":
+            if self._deterministic_redemption_triggered and self._redemption_arc_step == 3:
+                return False
+            if self.disorganizer_age_at_birth > 0:
+                steps_since_birth = self.age - self.disorganizer_age_at_birth
+                if steps_since_birth > 0 and steps_since_birth % Config.DISORGANIZER_SOUL_DECAY_STEPS == 0:
+                    self.soul_weight = max(0.1, self.soul_weight - Config.DISORGANIZER_SOUL_DECAY)
+            if self.disorganizer_age_at_birth > 0 and (self.age - self.disorganizer_age_at_birth) > Config.DISORGANIZER_LIFESPAN:
+                self._log_event("death_disorganizer_lifespan")
+                return True
+            if self.soul_weight < 0.1:
+                self._log_event("death_disorganizer_soul_lost")
+                return True
+            return False
+        if len(self.cells) == 0:
+            self._log_event("death_no_cells")
+            return True
+        if self.age < Config.YOUNG_PROTECTION_AGE and self.soul_weight > Config.YOUNG_PROTECTION_SOUL:
+            if phi_hash(self.id, self.age, 999) < Config.YOUNG_SURVIVAL_CHANCE:
+                return False
+        if self.pred_error > Config.PRED_ERROR_THRESHOLD:
+            if self.given_trigger and phi_hash(self.id, self.age) < 0.2:
+                return False
+            if self.coherence > 0.7 and phi_hash(self.id, self.age) < 0.5:
+                return False
+            if phi_hash(self.id, self.age) < 0.3:
+                self._log_event("death_high_error")
+                return True
+        if self.protection_level > 0.2:
+            death_prob = 0.1 * (1.0 - self.protection_level)
+            if phi_hash(self.id, self.age, 777) < death_prob:
+                self._log_event("death_protected")
+                return True
+            return False
+        if self.soul_weight < 0.1:
+            self._log_event("death_soul_lost")
+            return True
+        if self.unresolved_contradiction < 0.01:
+            self._log_event("death_no_contradiction")
+            return True
+        if len(self.cells) < 2 and self.age > 5:
+            self._log_event("death_starvation")
+            return True
+        if self.age > 120 and self.energy < 0.05:
+            self._log_event("death_old_age")
+            return True
+        if self.soul_weight < 0.2 and self.age > 50 and self.pred_error > 0.5:
+            self._log_event("death_zombie")
+            return True
+        return False
+
+print("✅ Cell 3a-1 loaded: Pattern lifecycle, growth, division, competition, death + episodic_buffer maxlen=200")
