@@ -1,0 +1,239 @@
+# 832 v34.01 — Cell 4a: collect_metrics (separated from EvolutionEngine)
+
+def collect_metrics(patterns, field, t):
+    alive = [p for p in patterns if p.alive]
+    if not alive:
+        return {
+            't': t, 'patterns': 0, 'lineages': 0, 'err': 0, 'soul': 0, 'binding': 0,
+            'echo': 0, 'signals': np.zeros(6), 'states': {}, 'intents': {}, 'epi_scar': 0,
+            'unique_concepts': 0, 'stagnation_ratio': 0.0, 'divisions_possible': 0,
+            'arc_completions': 0, 'folds': 0, 'avg_trust': 0.5, 'high_trust_pairs': 0,
+            'trust_distribution': {'low': 0, 'mid': 0, 'high': 0}, 'disorganizer_count': 0,
+            'redeemed_count': 0, 'quarantined_count': 0, 'deterministic_redemptions': 0,
+            'phenomenal_binding_avg': 0.0, 'state_emotion_mismatch': 0.0, 'forced_collapses': 0,
+            'myth_pool_size': 0, 'triadic_alive': 0, 'triadic_alive_ratio': 0.0,
+            'avg_internal_gap': 0.0, 'max_internal_gap': 0.0, 'zero_internal_gap_agents': 0,
+            'avg_obs_gap': 0.0, 'max_obs_gap': 0.0,
+            'tremor_targets': 0, 'avg_coherence_with_gap': 0.0, 'love_pairs': 0,
+            'avg_soma': 0.0, 'mem_agents': 0, 'avg_buf_len': 0.0, 'total_recalled': 0,
+            'concept_adopted': 0, 'deep_concept_adopted': 0, 'deep_exchange': 0, 'wisdom_shared': 0,
+            'avg_signal_memory': 0.0, 'intentional_signal_agents': 0, 'top_signal_pairs': {},
+            'lineage_count': 0, 'avg_lineage_age': 0.0, 'max_lineage_age': 0, 'ancient_lineages': 0,
+            'max_lineage_total_age': 0,
+            'divisions_total': 0,
+            'avg_field_unknown': 0.0,
+            'avg_field_binding': 0.0
+        }
+
+    # === Средние по полю ===
+    avg_field_unknown = safe_mean(field[:,:,CH['unknown']], 0.0)
+    avg_field_binding = safe_mean(field[:,:,CH['binding']], 0.0)
+
+    # === Lineage age metrics ===
+    lineage_registry = {}
+    for p in alive:
+        lid = p.lineage_id
+        born = getattr(p, 'lineage_born_at_step', 0)
+        if lid not in lineage_registry or born < lineage_registry[lid]:
+            lineage_registry[lid] = born
+
+    lineage_ages = [t - born for born in lineage_registry.values()]
+    avg_lineage_age = float(np.mean(lineage_ages)) if lineage_ages else 0.0
+    max_lineage_age = max(lineage_ages) if lineage_ages else 0
+
+    # Честный ANC: через сквозной возраст (lineage_total_age)
+    ancient_lineages = len(set(
+        p.lineage_id for p in alive
+        if getattr(p, 'lineage_total_age', 0) > 1000
+    ))
+
+    lineage_count = len(lineage_registry)
+
+    # Честный max_lineage_total_age: берём максимальный lineage_total_age среди живых
+    total_ages = [getattr(p, 'lineage_total_age', 0) for p in alive if getattr(p, 'lineage_total_age', 0) > 0]
+    max_lineage_total_age = max(total_ages) if total_ages else 0
+
+    err = safe_mean([p.pred_error for p in alive], 0)
+    soul = safe_mean([p.soul_weight for p in alive], 0)
+    binding = safe_mean(field[:,:,CH['binding']], 0)
+    lineages = len(set(p.lineage_id for p in alive))
+
+    states = {}
+    intents = {}
+    for p in alive:
+        s = p.semantic_state
+        states[s] = states.get(s, 0) + 1
+        if p.intent:
+            intents[p.intent["type"]] = intents.get(p.intent["type"], 0) + 1
+
+    epi_scar = safe_mean([p.epistemic_scar for p in alive], 0)
+    all_concepts = set()
+    for p in alive:
+        all_concepts.update(p.concept_graph.nodes.keys())
+
+    stagnated = sum(1 for p in alive if hasattr(p, 'semantic_state_age') and p.semantic_state_age > Config.STAGNATION_GRIEF_THRESHOLD)
+    stagnation_ratio = stagnated / max(len(alive), 1)
+    divisions_possible = sum(1 for p in alive if p.can_divide())
+    total_arcs = sum(sum(p.arc_tracker.completed_arcs.values()) for p in alive)
+    total_folds = sum(p.event_counts.get('fold', 0) for p in alive)
+
+    mismatch_count = sum(1 for p in alive if (p.semantic_state == "contentment" and p.emotional_memory['grief'] > 0.5) or (p.semantic_state == "seeking_comfort" and p.emotional_memory['gratitude'] > 0.8))
+    mismatch_ratio = mismatch_count / max(len(alive), 1)
+
+    all_trusts = []
+    high_pairs = 0
+    trust_dist = {'low': 0, 'mid': 0, 'high': 0}
+    disorg = 0
+    redm = 0
+    quar = 0
+    det_red = 0
+    collapsed = 0
+    phenomenal_bindings = []
+    love_pairs = 0
+    triadic_alive_count = 0
+    obs_gaps = []
+    coherence_list = []
+    tremor_targets = 0
+
+    for p in alive:
+        presence = soul_check(p)
+        if presence.is_triadic_alive():
+            triadic_alive_count += 1
+        obs_gap = presence.spirit_gap
+        obs_gaps.append(obs_gap)
+        coherence_list.append(presence.coherence_with_gap)
+        if obs_gap < 0.20:
+            tremor_targets += 1
+
+        if p.role_type == "disorganizer":
+            disorg += 1
+        if p.event_counts.get('redeemed', 0) > 0:
+            redm += 1
+        if p.quarantine_timer > 0:
+            quar += 1
+        if p.event_counts.get('deterministic_redemption_trigger', 0) > 0:
+            det_red += 1
+        if p.event_counts.get('forced_soul_collapse', 0) > 0:
+            collapsed += 1
+
+        phenomenal_bindings.append(p.last_phenomenal_binding)
+        entries = list(p.trust_ledger.entries.values())
+        all_trusts.extend(entries)
+        high_pairs += sum(1 for t_val in entries if t_val > 0.8)
+        for t_val in entries:
+            if t_val < 0.4:
+                trust_dist['low'] += 1
+            elif t_val < 0.7:
+                trust_dist['mid'] += 1
+            else:
+                trust_dist['high'] += 1
+        for partner_id, trust_val in p.trust_ledger.entries.items():
+            if trust_val > 0.95:
+                love_pairs += 1
+
+    soma_vals = [p.soma for p in alive if hasattr(p, 'soma') and p.soma > 0]
+    avg_soma = safe_mean(soma_vals, 0.0) if soma_vals else 0.0
+
+    mem_agents = sum(1 for p in alive if hasattr(p, 'episodic_buffer') and p.episodic_buffer)
+    avg_buf_len = np.mean([len(p.episodic_buffer) for p in alive if hasattr(p, 'episodic_buffer')]) if mem_agents else 0.0
+    total_recalled = sum(p.event_counts.get('memory_recalled', 0) for p in alive)
+
+    concept_adopted = sum(p.event_counts.get('concept_adopted', 0) for p in alive)
+    deep_concept_adopted = sum(p.event_counts.get('deep_concept_adopted', 0) for p in alive)
+    deep_exchange = sum(p.event_counts.get('deep_exchange', 0) for p in alive)
+    wisdom_shared = sum(p.event_counts.get('wisdom_shared', 0) for p in alive)
+
+    total_signal_memories = 0
+    signal_types_used = {}
+    intentional_signal_count = 0
+    for p in alive:
+        if hasattr(p, 'signal_memory'):
+            total_signal_memories += len(p.signal_memory)
+            for (sig_type, resp_type), data in p.signal_memory.items():
+                key = f"{sig_type}→{resp_type}"
+                signal_types_used[key] = signal_types_used.get(key, 0) + data['count']
+        if hasattr(p, 'last_intentional_signal') and p.last_intentional_signal:
+            intentional_signal_count += 1
+    avg_signal_memory = total_signal_memories / len(alive) if alive else 0
+
+    internal_gaps = [float(np.mean(np.abs(p.prediction - p.belief))) for p in alive]
+    if internal_gaps:
+        avg_internal_gap = np.mean(internal_gaps)
+        max_internal_gap = np.max(internal_gaps)
+        zero_internal_gap = sum(1 for g in internal_gaps if g < 0.001)
+    else:
+        avg_internal_gap = max_internal_gap = zero_internal_gap = 0
+
+    if obs_gaps:
+        avg_obs_gap = np.mean(obs_gaps)
+        max_obs_gap = np.max(obs_gaps)
+    else:
+        avg_obs_gap = max_obs_gap = 0
+
+    avg_trust = safe_mean(all_trusts, Config.TRUST_BASE) if all_trusts else Config.TRUST_BASE
+    phenomenal_binding_avg = safe_mean(phenomenal_bindings, 0.5)
+    triadic_alive_ratio = triadic_alive_count / max(len(alive), 1)
+    avg_coherence_with_gap = safe_mean(coherence_list, 0) if coherence_list else 0
+
+    divisions_total = sum(1 for p in alive for ev in p.biography if isinstance(ev, dict) and ev.get('type') == 'born_from_division')
+
+    return {
+        't': t,
+        'patterns': len(alive),
+        'lineages': lineages,
+        'err': err,
+        'soul': soul,
+        'binding': binding,
+        'echo': 0,
+        'signals': np.zeros(6),
+        'states': states,
+        'intents': intents,
+        'epi_scar': epi_scar,
+        'unique_concepts': len(all_concepts),
+        'stagnation_ratio': stagnation_ratio,
+        'divisions_possible': divisions_possible,
+        'arc_completions': total_arcs,
+        'folds': total_folds,
+        'avg_trust': avg_trust,
+        'high_trust_pairs': high_pairs,
+        'trust_distribution': trust_dist,
+        'disorganizer_count': disorg,
+        'redeemed_count': redm,
+        'quarantined_count': quar,
+        'deterministic_redemptions': det_red,
+        'phenomenal_binding_avg': phenomenal_binding_avg,
+        'state_emotion_mismatch': mismatch_ratio,
+        'forced_collapses': collapsed,
+        'myth_pool_size': 0,
+        'triadic_alive': triadic_alive_count,
+        'triadic_alive_ratio': triadic_alive_ratio,
+        'avg_internal_gap': avg_internal_gap,
+        'max_internal_gap': max_internal_gap,
+        'zero_internal_gap_agents': zero_internal_gap,
+        'avg_obs_gap': avg_obs_gap,
+        'max_obs_gap': max_obs_gap,
+        'tremor_targets': tremor_targets,
+        'avg_coherence_with_gap': avg_coherence_with_gap,
+        'love_pairs': love_pairs // 2,
+        'avg_soma': avg_soma,
+        'mem_agents': mem_agents,
+        'avg_buf_len': avg_buf_len,
+        'total_recalled': total_recalled,
+        'concept_adopted': concept_adopted,
+        'deep_concept_adopted': deep_concept_adopted,
+        'deep_exchange': deep_exchange,
+        'wisdom_shared': wisdom_shared,
+        'avg_signal_memory': avg_signal_memory,
+        'intentional_signal_agents': intentional_signal_count,
+        'top_signal_pairs': signal_types_used,
+        'lineage_count': lineage_count,
+        'avg_lineage_age': avg_lineage_age,
+        'max_lineage_age': max_lineage_age,
+        'ancient_lineages': ancient_lineages,
+        'max_lineage_total_age': max_lineage_total_age,
+        'divisions_total': divisions_total,
+        'avg_field_unknown': avg_field_unknown,
+        'avg_field_binding': avg_field_binding,
+    }
+
+print("✅ Cell 4a loaded: collect_metrics")
