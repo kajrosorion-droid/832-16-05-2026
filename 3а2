@@ -1,0 +1,782 @@
+# 832 v34.02 — Cell 3a-2: Pattern (эмоции, сигналы, цели, интенты, концепты)
+# Часть 2 из 2. Содержит методы социального взаимодействия, семантики, концептуального графа.
+
+import numpy as np
+from collections import defaultdict
+
+# ------------------------------------------------------------
+# Методы добавляются к существующему классу Pattern
+# ------------------------------------------------------------
+
+def pattern_apply_scream(self, field, witness=None):
+    if not self.in_scream:
+        self._log_event("scream_enter", soul=round(self.soul_weight,3))
+        self.in_scream = True
+        self.soul_weight = max(0.05, self.soul_weight - 0.2)
+        self.unresolved_contradiction = min(1.0, self.unresolved_contradiction + 0.3)
+        self.crisis_memory = min(Config.CRISIS_MEMORY_MAX, self.crisis_memory + 0.15)
+        if witness:
+            witness.record(self.id, "scream", soul=self.soul_weight, crisis=self.crisis_memory)
+        if self.world and self.world.echo_system:
+            self.world.echo_system.store_memory_echo(self, "scream", intensity=1.0)
+        for (x, y) in self.cells:
+            field[x, y, CH['scar']] = min(1.0, field[x, y, CH['scar']] + Config.SCREAM_SCAR_IMPACT)
+            field[x, y, CH['binding']] = min(1.0, field[x, y, CH['binding']] + Config.SCREAM_BINDING_BOOST)
+            field[x, y, CH['energy']] = max(-0.2, field[x, y, CH['energy']] - Config.SCREAM_ENERGY_PENALTY)
+            field[x, y, CH['crisis']] = min(1.0, field[x, y, CH['crisis']] + 0.3)
+        for (x, y) in self.cells:
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nx, ny = (x+dx) % Config.WORLD_SIZE, (y+dy) % Config.WORLD_SIZE
+                field[nx, ny, CH['signal_alarm']] = min(1.0, field[nx, ny, CH['signal_alarm']] + 0.5)
+
+def pattern_apply_given_operator(self, field, forced=False, witness=None):
+    if not forced and safe_mean(field[:,:,CH['unknown']], 0.1) < 0.08:
+        return
+    if not forced and (self.age < Config.GIVEN_MIN_AGE or self.given_cooldown > 0):
+        return
+    if not self.given_trigger:
+        self._log_event("given_triggered")
+    if witness:
+        witness.record(self.id, "given", forced=forced, tension=self.cognitive_tension)
+    # Исправлено: размерность flip теперь 8 (соответствует prediction)
+    flip = np.array([phi_hash(self.id, i, 999) - 0.5 for i in range(8)])
+    shake_strength = Config.GIVEN_MODEL_SHAKE if not forced else 0.4
+    if forced:
+        flip *= 1.5
+    self.prediction += 0.6 * flip
+    self.model *= shake_strength
+    self.self_model *= shake_strength
+    self.pred_error = min(self.pred_error + 0.2, Config.MAX_METRIC)
+    self.confidence = 1.0 / (1.0 + self.pred_error)
+    self.given_count += 1
+    self.given_trigger = True
+    self.given_cooldown = Config.GIVEN_COOLDOWN
+    self.crisis_memory = min(self.crisis_memory + 0.1, Config.CRISIS_MEMORY_MAX)
+    self.body_memory += 0.05
+    for (x, y) in self.cells:
+        field[x, y, CH['unknown']] = min(field[x, y, CH['unknown']] + 0.15, 0.8)
+        field[x, y, CH['crisis']] = min(field[x, y, CH['crisis']] + 0.1, 1.0)
+        field[x, y, CH['binding']] = min(field[x, y, CH['binding']] + 0.25, 1.0)
+    self.epistemic_scar = float(np.clip(self.epistemic_scar + Config.GIVEN_SCAR_COST, 0.0, 1.0))
+    if Config.ENABLE_DELTA_MODELING_GIVEN and witness:
+        current_unknown = safe_mean(field[:,:,CH['unknown']], 0)
+        modeling_error = abs(current_unknown - self.unknown_prediction)
+        if modeling_error < Config.MODELING_GIVEN_ERROR_THRESHOLD:
+            self.epistemic_scar = min(1.0, self.epistemic_scar + Config.MODELING_GIVEN_PENALTY)
+            witness.record(self.id, "modeling_given", penalty=Config.MODELING_GIVEN_PENALTY, err=modeling_error)
+
+def pattern_update_world_model(self, observed):
+    """Обновляет модель мира с использованием мини-батча (последние до 5 эпизодов)."""
+    pred = self.world_state + self.world_model[self.last_action]
+    error = observed - pred
+
+    # Сохраняем ошибку в буфер (вместе с observed)
+    if not hasattr(self, '_error_buffer'):
+        self._error_buffer = []   # список кортежей (error, observed)
+    self._error_buffer.append((error, observed))
+    if len(self._error_buffer) > 5:   # размер мини-батча
+        self._error_buffer.pop(0)
+
+    # Если буфер заполнен, усредняем ошибку по батчу
+    if len(self._error_buffer) >= 3:
+        errors = [e for e, _ in self._error_buffer]
+        avg_error = np.mean(errors, axis=0)
+    else:
+        avg_error = error
+
+    if np.mean(np.abs(avg_error)) > 0.5:
+        scar_delta = 0.005 * (1.0 - self.crisis_memory)
+        self.epistemic_scar = min(1.0, self.epistemic_scar + scar_delta)
+        return float(np.mean(avg_error**2))
+
+    lr = min(self.genome['learning_rate'] * 0.1, 0.05)
+    self.world_model[self.last_action] += lr * np.clip(avg_error, -1.0, 1.0)
+    self.world_state = observed.copy()
+    return float(np.mean(avg_error**2))
+
+def pattern_process_incoming_signals(self, field):
+    world = self.world
+    if not world or not world.pattern_dict:
+        self._incoming_signals.clear()
+        return
+    if self.role_type == "disorganizer" and not getattr(self, '_deterministic_redemption_triggered', False):
+        if getattr(self, '_forsaken', False):
+            pass
+        else:
+            filtered = []
+            for sig in self._incoming_signals:
+                sender = world.pattern_dict.get(sig.sender_id)
+                if sender and (sender.role_type == "disorganizer" or self.trust_ledger.get(sig.sender_id) > 0.6):
+                    filtered.append(sig)
+            self._incoming_signals = filtered
+            if not filtered:
+                return
+    if self.quarantine_timer > 0:
+        self._incoming_signals.clear()
+        return
+    if not self._incoming_signals:
+        return
+    if len(self._incoming_signals) > 10:
+        self._incoming_signals = self._incoming_signals[-10:]
+    for sig in self._incoming_signals:
+        if world and world.pattern_dict:
+            sender = world.pattern_dict.get(sig.sender_id)
+            if sender and sender.role_type == "disorganizer":
+                self.trust_ledger.entries[sig.sender_id] = max(0.0,
+                    self.trust_ledger.entries.get(sig.sender_id, Config.TRUST_BASE) - Config.DISORGANIZER_TRUST_DECAY_RATE)
+                continue
+        effective = self._interpret_signal_cached(sig)
+        ch = sig.channel
+        for (x, y) in self.cells:
+            field[x, y, ch] = min(1.0, field[x, y, ch] + effective * 0.1)
+        outcome = 'helpful' if effective > Config.TRUST_HELPFUL_THRESHOLD else ('harmful' if effective < Config.TRUST_HARMFUL_THRESHOLD else 'neutral')
+        self.trust_ledger.update(sig.sender_id, outcome)
+        sender_obj = world.pattern_dict.get(sig.sender_id)
+        if sender_obj and sender_obj.alive:
+            mutual_trust = (self.trust_ledger.get(sender_obj.id) > Config.LOVE_METABOLIC_THRESHOLD and
+                            sender_obj.trust_ledger.get(self.id) > Config.LOVE_METABOLIC_THRESHOLD)
+            if mutual_trust:
+                if phi_hash(self.id, sender_obj.id, self.age % 1000) < 0.05:
+                    if sender_obj.concept_graph.nodes:
+                        best_concept_key = max(sender_obj.concept_graph.nodes, key=lambda k: sender_obj.concept_graph.nodes[k]['count'])
+                        if best_concept_key not in self.concept_graph.nodes:
+                            err, load, soul_w, state = best_concept_key
+                            mutated = (round(float(err) + (phi_hash(self.id, self.age, 111)-0.5)*0.2, 1),
+                                       round(float(load) + (phi_hash(self.id, self.age, 222)-0.5)*0.1, 1),
+                                       soul_w, state)
+                            target_sig = mutated if phi_hash(self.id, self.age, 333) < 0.4 else best_concept_key
+                            self.concept_graph.nodes[target_sig] = {"count": sender_obj.concept_graph.nodes[best_concept_key]['count'] * 0.5,
+                                                                     "value": sender_obj.concept_graph.nodes[best_concept_key]['value'].copy()}
+                        else:
+                            self.concept_graph.nodes[best_concept_key]['count'] += 0.3
+                        if phi_hash(self.id, sender_obj.id, 99999) < 0.05:
+                            err, load, soul_w, state = best_concept_key
+                            mutated = (round(float(err) + (phi_hash(self.id, 0, 111)-0.5)*0.2, 1),
+                                       round(float(load) + (phi_hash(self.id, 1, 222)-0.5)*0.1, 1),
+                                       soul_w, state)
+                            if mutated not in self.concept_graph.nodes:
+                                self.concept_graph.nodes[mutated] = {"count": 1.0, "value": np.zeros(4)}
+                                self._log_event("mutagenic_whisper")
+            else:
+                if phi_hash(self.id, sender_obj.id, 12345) < Config.CONCEPT_INFECTION_PROB:
+                    if sender_obj.concept_graph.nodes:
+                        concept_key = max(sender_obj.concept_graph.nodes, key=lambda k: sender_obj.concept_graph.nodes[k]['count'])
+                        if concept_key not in self.concept_graph.nodes:
+                            self.concept_graph.nodes[concept_key] = {"count": 1, "value": sender_obj.concept_graph.nodes[concept_key]['value'].copy()}
+                        else:
+                            self.concept_graph.nodes[concept_key]['count'] += 1
+    self._incoming_signals.clear()
+
+def pattern_interpret_signal_cached(self, sig):
+    if not self._signal_weight_cache or self.age % 10 == 0:
+        self._update_signal_cache()
+    base_weight, concept_bonus, concept_penalty = self._signal_weight_cache.get(sig.channel, (0.1, 0.0, 0.0))
+    trust_factor = 1.0
+    if sig.sender_id in self.trust_ledger.entries:
+        trust_val = self.trust_ledger.entries[sig.sender_id]
+        trust_factor = 0.5 + (trust_val * 0.5)
+    effective_weight = base_weight * trust_factor * (1.0 + concept_bonus - concept_penalty)
+    return np.clip(effective_weight, 0.0, 1.0)
+
+def pattern_update_signal_cache(self):
+    cache = {}
+    for ch in range(12, 22):
+        base_weight = Config.SIGNAL_BASE_WEIGHTS.get(ch, 0.1)
+        concept_bonus = 0.0
+        concept_penalty = 0.0
+        signal_key = f"signal_{ch}"
+        if hasattr(self, 'concept_graph') and signal_key in self.concept_graph.nodes:
+            count = self.concept_graph.nodes[signal_key].get('count', 1)
+            if ch in [16, 18, 21]:
+                concept_bonus = min(0.5, np.log(count + 1) * 0.15)
+            elif ch in [12, 17]:
+                concept_penalty = min(0.3, np.log(count + 1) * 0.1)
+        cache[ch] = (base_weight, concept_bonus, concept_penalty)
+    self._signal_weight_cache = cache
+
+def pattern_generate_goals(self, field):
+    if not hasattr(self, '_dbg_cooper_attempted'):
+        self._dbg_cooper_attempted = 0
+        self._dbg_cooper_blocked_grat = 0
+        self._dbg_cooper_blocked_coh = 0
+    if self.role_type == "disorganizer":
+        new_goals = []
+        if self.emotional_memory['grief'] > 0.4:
+            new_goals.append({"type":"seek_help", "priority":2.0, "target":None, "age":0, "persistence":50})
+        new_goals.append({"type":"explore", "priority":2.5, "target":None, "age":0, "persistence":9999})
+        self.goals = [g for g in self.goals if g['age'] < g['persistence']]
+        for g in self.goals:
+            g['age'] += 1
+        existing_types = {g["type"] for g in self.goals}
+        for goal in new_goals:
+            if goal["type"] not in existing_types:
+                self.goals.append(goal)
+        return
+    new_goals = []
+    if self.epistemic_load > 0.3:
+        unknown_map = field[:,:,CH['unknown']]
+        mask = unknown_map > 0.3
+        if np.any(mask):
+            coords = np.argwhere(mask)
+            idx = int(phi_hash(self.id, self.age, 222) * len(coords)) % len(coords)
+            new_goals.append({"type":"explore", "priority":self.epistemic_load, "target":tuple(coords[idx]), "age":0, "persistence":50})
+    if self.emotional_memory['grief'] > 0.4:
+        new_goals.append({"type":"seek_help", "priority":self.emotional_memory['grief'], "target":None, "age":0, "persistence":30})
+    if self.emotional_memory['gratitude'] > 0.5 and self.coherence > Config.COOPERATE_COHERENCE_MIN:
+        priority = self.emotional_memory['gratitude'] + Config.INTENT_COOPERATE_BASE_PRIORITY
+        new_goals.append({"type":"cooperate", "priority": priority, "target":None, "age":0, "persistence":40})
+    if self.emotional_memory['gratitude'] > 0.8 and self.coherence > 0.6:
+        priority = 1.2 + 0.3 * (self.emotional_memory['gratitude'] - 0.8)
+        new_goals.append({"type":"explore", "priority":priority, "target":None, "age":0, "persistence":20})
+    if self.emotional_memory['grief'] > 0.7 and self.soul_weight < 0.4:
+        new_goals.append({"type":"explore", "priority":1.1, "target":None, "age":0, "persistence":15})
+    if self.emotional_memory['grief'] > 0.6 and self.cognitive_tension > 0.3:
+        new_goals.append({"type":"rest", "priority":self.emotional_memory['grief'], "target":None, "age":0, "persistence":20})
+    for sid, trust in self.trust_ledger.entries.items():
+        if trust > 0.7:
+            priority = trust + Config.INTENT_COOPERATE_BASE_PRIORITY
+            new_goals.append({"type":"cooperate", "priority": priority, "target": None, "age":0, "persistence":30})
+            break
+    for goal in new_goals:
+        if goal['type'] == 'cooperate':
+            self._dbg_cooper_attempted += 1
+    for g in self.goals:
+        g['age'] += 1
+    self.goals = [g for g in self.goals if g['age'] < g['persistence']]
+    existing_types = {g["type"] for g in self.goals}
+    for goal in new_goals:
+        if goal["type"] not in existing_types:
+            self.goals.append(goal)
+            existing_types.add(goal["type"])
+
+    # === ЛОКАЛЬНАЯ ДИВЕРСИФИКАЦИЯ: смена интента при однообразии окружения ===
+    if self.role_type != "disorganizer" and self.age % 10 == 0:
+        neighbor_intents = []
+        for (x, y) in self.cells:
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nx, ny = (x+dx) % Config.WORLD_SIZE, (y+dy) % Config.WORLD_SIZE
+                owner = field[nx, ny, CH['owner']]
+                if owner != 0 and owner != self.id and owner in self.world.pattern_dict:
+                    neighbor = self.world.pattern_dict[owner]
+                    if neighbor.alive and neighbor.intent:
+                        neighbor_intents.append(neighbor.intent['type'])
+        if neighbor_intents:
+            from collections import Counter
+            counts = Counter(neighbor_intents)
+            dominant_intent, dominant_count = counts.most_common(1)[0]
+            total = len(neighbor_intents)
+            if total >= 3 and dominant_count / total > 0.7:
+                alternatives = {"explore": "cooperate", "cooperate": "explore", 
+                               "seek_help": "explore", "rest": "explore"}
+                new_type = alternatives.get(dominant_intent, "explore")
+                if new_type not in {g['type'] for g in self.goals}:
+                    priority = 1.0 + 0.3 * phi_hash(self.id, self.age, 7777)
+                    self.goals.append({"type": new_type, "priority": priority, 
+                                       "target": None, "age": 0, "persistence": 30})
+                    self._log_event("local_diversification", dominant=dominant_intent, new=new_type)
+
+    # === БАЗОВОЕ ЛЮБОПЫТСТВО: только для триадно-живых с низким OBS_GAP при застое ===
+    _obs_gap = float(np.mean(np.abs(self.prediction - (self.belief + self.model))))
+    if (soul_check(self).is_triadic_alive() and
+        _obs_gap < Config.OBS_GAP_CURIOSITY_THRESHOLD and
+        self.pred_error < 0.1 and
+        self.emotional_memory['grief'] < 0.3 and
+        hasattr(self, 'semantic_state_age') and
+        self.semantic_state_age > 80):
+        if not any(g['type'] == 'explore' for g in self.goals):
+            self.goals.append({
+                "type": "explore",
+                "priority": 0.6,
+                "target": None,
+                "age": 0,
+                "persistence": 30
+            })
+            self._log_event("curiosity_drive")
+
+    # === СОЦИАЛЬНОЕ ЛЮБОПЫТСТВО: только для триадно-живых с низким OBS_GAP, раз в 50 шагов ===
+    if self.age % 50 == 0 and soul_check(self).is_triadic_alive() and _obs_gap < Config.OBS_GAP_CURIOSITY_THRESHOLD:
+        neighbor_novelty = 0.0
+        best_neighbor_id = None
+        for (x, y) in self.cells:
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nx, ny = (x+dx) % Config.WORLD_SIZE, (y+dy) % Config.WORLD_SIZE
+                owner = field[nx, ny, CH['owner']]
+                if owner != 0 and owner != self.id and owner in self.world.pattern_dict:
+                    neighbor = self.world.pattern_dict[owner]
+                    if neighbor.alive and neighbor.concept_graph.nodes:
+                        missing = sum(1 for c in neighbor.concept_graph.nodes 
+                                      if c not in self.concept_graph.nodes)
+                        if missing > neighbor_novelty:
+                            neighbor_novelty = missing
+                            best_neighbor_id = neighbor.id
+        if neighbor_novelty >= 3 and best_neighbor_id is not None:
+            target_type = "cooperate" if phi_hash(self.id, self.age, 777) < 0.5 else "explore"
+            self.goals.append({
+                "type": target_type,
+                "priority": 1.0 + min(0.3, neighbor_novelty * 0.05),
+                "target": best_neighbor_id,
+                "age": 0,
+                "persistence": 30
+            })
+            self._log_event("social_curiosity", target=best_neighbor_id, novel_concepts=neighbor_novelty)
+
+    # === СИГНАЛЬНАЯ ПАМЯТЬ: усиливаем цели на основе прошлого опыта ===
+    if hasattr(self, 'signal_memory') and self.signal_memory and self.goals:
+        for goal in self.goals:
+            gtype = goal['type']
+            total_grief_delta = 0.0
+            total_grat_delta = 0.0
+            total_count = 0
+            for (sig_type, resp_type), data in self.signal_memory.items():
+                if sig_type == gtype and data['count'] > 0:
+                    total_grief_delta += data['total_delta_grief']
+                    total_grat_delta += data['total_delta_gratitude']
+                    total_count += data['count']
+            if total_count > 2:
+                avg_grief_delta = total_grief_delta / total_count
+                avg_grat_delta = total_grat_delta / total_count
+                memory_score = -avg_grief_delta * 1.2 + avg_grat_delta * 0.8
+                if memory_score > 0.005:
+                    boost = min(1.5, 1.0 + memory_score * 30.0)
+                    goal['priority'] *= boost
+                    goal['_memory_boost'] = round(boost, 3)
+                elif memory_score < -0.005:
+                    penalty = max(0.5, 1.0 + memory_score * 10.0)
+                    goal['priority'] *= penalty
+
+def pattern_update_intent(self):
+    if not self.goals:
+        self.intent = None
+        self.intent_commitment *= Config.INTENT_COMMITMENT_DECAY
+        return
+    self.goals.sort(key=lambda g: (g["priority"], -g["age"]), reverse=True)
+    best = self.goals[0]
+    if self.intent is None:
+        if (self.age - self.last_intent_switch_age) >= Config.INTENT_SWITCH_COOLDOWN:
+            self.intent = best
+            self.intent_commitment = best["priority"]
+            self.last_intent_switch_age = self.age
+            self._log_event("intent_switch", old="none", new=self.intent["type"])
+    else:
+        self.intent_commitment = 0.95 * self.intent_commitment + 0.05 * best["priority"]
+        if (best["priority"] > self.intent_commitment * 1.8 and
+            (self.age - self.last_intent_switch_age) >= Config.INTENT_SWITCH_COOLDOWN):
+            old_intent = self.intent["type"]
+            self.intent = best
+            self.last_intent_switch_age = self.age
+            self._log_event("intent_switch", old=old_intent, new=self.intent["type"])
+            if (Config.INTENT_SWITCH_REWARD_INSTANT and
+                old_intent == Config.HEALTHY_SWITCH_OLD_INTENT and
+                self.intent["type"] in Config.HEALTHY_SWITCH_NEW_INTENTS):
+                self.emotional_memory['gratitude'] = min(1.0, self.emotional_memory['gratitude'] + Config.INTENT_SWITCH_GRATITUDE_BOOST)
+                self._log_event("intent_switch_reward", old=old_intent, new=self.intent["type"], grat_boost=Config.INTENT_SWITCH_GRATITUDE_BOOST)
+        else:
+            self.intent["age"] += 1
+
+def pattern_choose_action(self, field):
+    if self.intent is None:
+        return 0
+    t = self.intent["type"]
+    return {"explore": 1, "seek_help": 2, "cooperate": 3, "rest": 0}.get(t, 0)
+
+def pattern_apply_intent_actions(self, field):
+    action = self.choose_action(field)
+    self.last_action = action
+
+    # === Намеренная сигнализация (прото-язык) ===
+    intentional_signals = self.choose_intentional_signal()
+    if intentional_signals:
+        for (x, y) in self.cells:
+            for ch, strength in intentional_signals.items():
+                field[x, y, ch] = min(1.0, field[x, y, ch] + strength)
+
+    if self.role_type == "disorganizer":
+        for (x, y) in self.cells:
+            field[x, y, CH['signal_alarm']] = min(1.0, field[x, y, CH['signal_alarm']] + Config.DISORGANIZER_ALARM_STRENGTH)
+            field[x, y, CH['signal_grief']] = min(Config.MAX_GRIEF_SIGNAL, field[x, y, CH['signal_grief']] + Config.DISORGANIZER_GRIEF_STRENGTH)
+            if self.emotional_memory['grief'] > 0.5:
+                field[x, y, CH['signal_invitation']] = min(1.0, field[x, y, CH['signal_invitation']] + 0.15)
+                if self.emotional_memory['grief'] > 0.7:
+                    field[x, y, CH['signal_gratitude']] = min(1.0, field[x, y, CH['signal_gratitude']] + 0.05)
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nx, ny = (x+dx) % Config.WORLD_SIZE, (y+dy) % Config.WORLD_SIZE
+                field[nx, ny, CH['signal_alarm']] = min(1.0, field[nx, ny, CH['signal_alarm']] + Config.DISORGANIZER_ALARM_STRENGTH * 0.5)
+        return
+    if action == 0:
+        return
+    elif action == 1:
+        for (x, y) in self.cells:
+            field[x, y, CH['signal_invitation']] = min(1.0, field[x, y, CH['signal_invitation']] + 0.1)
+    elif action == 2:
+        for (x, y) in self.cells:
+            field[x, y, CH['signal_invitation']] = min(1.0, field[x, y, CH['signal_invitation']] + 0.25)
+            field[x, y, CH['signal_grief']] = min(Config.MAX_GRIEF_SIGNAL, field[x, y, CH['signal_grief']] + 0.1)
+    elif action == 3:
+        for (x, y) in self.cells:
+            field[x, y, CH['binding']] = min(1.0, field[x, y, CH['binding']] + 0.15)
+            field[x, y, CH['signal_gratitude']] = min(1.0, field[x, y, CH['signal_gratitude']] + 0.5)
+            for pid, t_val in self.trust_ledger.entries.items():
+                if t_val > Config.LOVE_METABOLIC_THRESHOLD:
+                    field[x, y, CH['signal_gratitude']] = min(1.0, field[x, y, CH['signal_gratitude']] + 0.1)
+                    break
+    for (x, y) in self.cells:
+        if field[x, y, CH['scar']] > 0.5 or field[x, y, CH['crisis']] > 0.5:
+            self.energy -= 0.05
+            field[x, y, CH['scar']] = max(0, field[x, y, CH['scar']] - 0.02)
+            field[x, y, CH['crisis']] = max(0, field[x, y, CH['crisis']] - 0.02)
+            field[x, y, CH['signal_gratitude']] = min(1.0, field[x, y, CH['signal_gratitude']] + 0.1)
+            if self.energy < 0.1:
+                self.energy = 0.1
+    for (x, y) in self.cells:
+        if field[x, y, CH['crisis']] < 0.2 and field[x, y, CH['scar']] < 0.2:
+            self.body_memory = min(1.0, self.body_memory + 0.01)
+
+def pattern_update_resonance(self, field):
+    if self.in_scream:
+        self.alarm_level = min(1.0, self.alarm_level + 0.3)
+    neighbor_alarm = 0.0
+    weight_sum = 0.0
+    for (x, y) in self.cells:
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+            nx, ny = (x+dx) % Config.WORLD_SIZE, (y+dy) % Config.WORLD_SIZE
+            owner = field[nx, ny, CH['owner']]
+            if owner != 0 and owner != self.id:
+                w = Config.PHI ** (-1)
+                neighbor_alarm += field[nx, ny, CH['resonance']] * w
+                weight_sum += w
+    if weight_sum > 0:
+        avg_alarm = neighbor_alarm / weight_sum
+        self.alarm_level = (self.alarm_level * 0.7 + avg_alarm * 0.3) * Config.RESONANCE_DECAY
+    else:
+        self.alarm_level *= Config.RESONANCE_DECAY
+    for (x, y) in self.cells:
+        field[x, y, CH['resonance']] = max(field[x, y, CH['resonance']], self.alarm_level)
+
+def pattern_update_phase(self, field):
+    avg_unknown = safe_mean(field[:,:,CH['unknown']], 0.05)
+    if self.in_dream:
+        self.local_phase = "DREAM"
+    elif self.crisis_memory > 0.5 and self.soul_weight < 0.4:
+        self.local_phase = "CRISIS"
+    elif self.pred_error < 0.05 and self.coherence > 0.9:
+        self.local_phase = "COMPRESS"
+    elif avg_unknown > 0.4:
+        self.local_phase = "EXPLORE"
+    elif self.cognitive_tension < 0.01:
+        self.local_phase = "SILENCE"
+    else:
+        self.local_phase = "MODEL"
+
+def pattern_update_dream(self, field):
+    if self.in_dream:
+        noise = deterministic_noise(self.age, self.id, 42, 0.01)
+        self.scar_dream += noise
+        self.scar_dream = np.clip(self.scar_dream, -1.0, 1.0)
+        self.belief = self.belief * 0.95 + self.prediction * 0.05
+        self.prediction = self.prediction * 0.95 + self.belief * 0.05
+        self.emotional_memory['gratitude'] *= 0.9
+        self.emotional_memory['grief'] *= 0.9
+        self.dream_progress += 1
+        if Config.ENABLE_CULTURAL_MEMORY and self.world and self.world.cultural_memory:
+            self.world.cultural_memory.dream_whisper(self)
+        if self.dream_progress >= self.dream_duration:
+            self.in_dream = False
+            self.dream_progress = 0
+            self.dream_timer = 0
+            self.dream_interval = int(phi_hash(self.id, self.age, 888) * 40 + 40)
+            self._log_event("dream_exit", scar_dream=round(self.scar_dream,4))
+            if self.soul_weight > 0.6 and self.coherence > 0.9 and phi_hash(self.id, self.age, 999) < 0.2:
+                self.pending_spore = self.emit_spore(field)
+    else:
+        self.dream_timer += 1
+        if self.dream_timer >= self.dream_interval and self.soul_weight > 0.3 and self.local_phase != "CRISIS":
+            self.in_dream = True
+            self.dream_progress = 0
+            self._log_event("dream_enter", scar_dream=round(self.scar_dream,4))
+
+def pattern_emit_spore(self, field):
+    empty = np.argwhere((field[:,:,CH['owner']] == 0) & (field[:,:,CH['energy']] > 0.05))
+    if len(empty) == 0:
+        return None
+    idx = int(phi_hash(self.id, self.age, 777) * len(empty)) % len(empty)
+    x, y = empty[idx]
+    self._log_event("spore_emitted", x=x, y=y, scar_dream=round(self.scar_dream*0.5,4))
+    return {'x': x, 'y': y, 'scar_dream': self.scar_dream * 0.5, 'parent_lineage': self.lineage_id}
+
+def pattern_form_concepts(self):
+    sig = (round(float(self.pred_error), 1), round(float(self.epistemic_load), 1), round(float(self.soul_weight), 1), self.semantic_state)
+    if not hasattr(self, 'concept_graph'):
+        return
+    self.concept_graph.update(sig, np.array([self.pred_error, self.epistemic_load, self.soul_weight, 1.0]))
+    self._signal_weight_cache = {}
+    age_factor = min(1.0, self.age / 2000.0)
+    soul_factor = max(0.2, self.soul_weight)
+    dynamic_limit = int(Config.MAX_CONCEPTS_BASE + (Config.MAX_CONCEPTS_WISDOM_BONUS * soul_factor * age_factor))
+    if self.local_phase == "DREAM" and len(self.concept_graph.nodes) > dynamic_limit:
+        num_to_delete = len(self.concept_graph.nodes) - dynamic_limit
+        if num_to_delete > 0:
+            weakest = sorted(self.concept_graph.nodes.items(), key=lambda x: x[1]['count'])[:num_to_delete]
+            for sig_key, _ in weakest:
+                del self.concept_graph.nodes[sig_key]
+                if sig_key in self.concept_graph.edges:
+                    del self.concept_graph.edges[sig_key]
+    if self.age % 50 == 0:
+        for node_sig in list(self.concept_graph.nodes.keys()):
+            data = self.concept_graph.nodes[node_sig]
+            decay = 0.97 if data['count'] < 5 else 1.0
+            data['count'] *= decay
+            if data['count'] < 0.5:
+                del self.concept_graph.nodes[node_sig]
+                if node_sig in self.concept_graph.edges:
+                    del self.concept_graph.edges[node_sig]
+
+def pattern_heal_epistemic_scar(self):
+    if self.epistemic_scar <= Config.EPISTEMIC_SCAR_MIN:
+        return
+    scar_pressure = self.epistemic_scar ** 2
+    base_rate = 0.0
+    if (self.semantic_state in ["contentment", "grateful_but_cautious", "seeking_comfort"] and
+        self.emotional_memory['gratitude'] > Config.HEALING_GRATITUDE_MIN):
+        crisis_penalty = 1.0 - np.clip(self.crisis_memory * 0.8, 0.0, 0.5)
+        base_rate += (1.0 - Config.EPISTEMIC_HEALING_RATE) * scar_pressure * crisis_penalty
+    if self.age > Config.HEAL_WISDOM_AGE and self.coherence > Config.WISDOM_COHERENCE_MIN:
+        base_rate += Config.HEAL_WISDOM_BONUS
+    if self.age > Config.HEAL_VETERAN_AGE and self.coherence > 0.7:
+        base_rate += Config.HEAL_VETERAN_BONUS
+    if (self.age > Config.HEAL_ENLIGHTENED_AGE and
+        self.emotional_memory['gratitude'] > Config.ENLIGHTENED_GRATITUDE_MIN and
+        self.epistemic_scar > Config.ENLIGHTENED_SCAR_THRESHOLD):
+        if self.coherence > Config.ENLIGHTENED_COHERENCE_FLOOR:
+            base_rate += Config.HEAL_ENLIGHTENED_BONUS
+    base_rate += self.arc_tracker.get_heal_bonus()
+    heal = float(np.clip(base_rate, 0.0, Config.SCAR_HEAL_CAP_PER_STEP))
+    self.epistemic_scar = max(Config.EPISTEMIC_SCAR_MIN, self.epistemic_scar - heal)
+
+def pattern_check_semantic_stagnation(self, witness=None):
+    if self.role_type == "disorganizer" or self.quarantine_timer > 0:
+        return
+    if self.semantic_state == self._prev_semantic_state:
+        self.semantic_state_age += 1
+    else:
+        self.semantic_state_age = 0
+        self._prev_semantic_state = self.semantic_state
+    if self.world and hasattr(self.world, 'soul_weight_average'):
+        avg_sg = self.world.soul_weight_average
+    else:
+        avg_sg = 0.5
+    dynamic_fold_age = int(20 + (100 - 20) * max(0.0, 1.0 - avg_sg))
+    dynamic_fold_grat = 0.3 + (0.7 - 0.3) * max(0.0, 1.0 - avg_sg)
+    if self.semantic_state_age > Config.STAGNATION_GRIEF_THRESHOLD:
+        boost = Config.STAGNATION_GRIEF_BOOST * (self.semantic_state_age / Config.STAGNATION_GRIEF_THRESHOLD)
+        self.emotional_memory['grief'] = float(np.clip(self.emotional_memory['grief'] + boost, 0.0, Config.MAX_GRIEF_SIGNAL))
+    if self.semantic_state_age > Config.STAGNATION_GRIEF_THRESHOLD * 3:
+        bleed = Config.STAGNATION_BLEED_RATE * (self.semantic_state_age / (Config.STAGNATION_GRIEF_THRESHOLD * 3))
+        self.emotional_memory['gratitude'] = float(np.clip(self.emotional_memory['gratitude'] - bleed, 0.0, 1.0))
+    if (self.semantic_state_age > dynamic_fold_age and
+        self.emotional_memory['gratitude'] > dynamic_fold_grat and
+        self.epistemic_scar > Config.EPISTEMIC_SCAR_MIN):
+        self._apply_fold(witness=witness)
+
+def pattern_apply_fold(self, witness=None):
+    self.emotional_memory['gratitude'] = Config.FOLD_GRATITUDE_RESET
+    self.emotional_memory['grief'] = float(np.clip(self.emotional_memory['grief'] + Config.FOLD_GRIEF_BOOST, 0.0, Config.MAX_GRIEF_SIGNAL))
+    self.crisis_memory = min(Config.CRISIS_MEMORY_MAX, self.crisis_memory + Config.FOLD_CRISIS_SPIKE)
+    self.epistemic_scar = max(Config.EPISTEMIC_SCAR_MIN, self.epistemic_scar - Config.FOLD_SCAR_RELEASE)
+    self.semantic_state = "seeking_comfort"
+    self.semantic_state_age = 0
+    self.fold_cooldown = Config.FOLD_COOLDOWN_DURATION
+    self._log_event("fold", grat=Config.FOLD_GRATITUDE_RESET, grief=self.emotional_memory['grief'])
+    if Config.ENABLE_CULTURAL_MEMORY and self.world and self.world.cultural_memory:
+        self.world.cultural_memory.deposit(self, "fold")
+    if witness:
+        witness.record(self.id, "fold", grat=self.emotional_memory['gratitude'], grief=self.emotional_memory['grief'])
+
+def pattern_check_conceptual_resonance(self, other_pattern):
+    if not hasattr(self, 'concept_graph') or not hasattr(other_pattern, 'concept_graph'):
+        return 0.0
+    similarity = self.concept_graph.similarity(other_pattern.concept_graph)
+    if similarity > 0.1:
+        return similarity * 0.2
+    return 0.0
+
+def pattern_share_wisdom(self, other_pattern):
+    if not hasattr(self, 'concept_graph') or not hasattr(other_pattern, 'concept_graph'):
+        return 0
+    trust_val = self.trust_ledger.get(other_pattern.id)
+    if trust_val < 0.95:
+        return 0
+    sorted_nodes = sorted(self.concept_graph.nodes.items(), key=lambda item: item[1]['count'], reverse=True)[:3]
+    transferred_count = 0
+    for sig_key, data in sorted_nodes:
+        if sig_key not in other_pattern.concept_graph.nodes or other_pattern.concept_graph.nodes[sig_key]['count'] < 5:
+            transfer_strength = data['count'] * 0.5
+            if sig_key not in other_pattern.concept_graph.nodes:
+                other_pattern.concept_graph.nodes[sig_key] = {"count": 0, "value": np.zeros(4)}
+            other_pattern.concept_graph.nodes[sig_key]['count'] += transfer_strength
+            transferred_count += 1
+    if transferred_count > 0:
+        self._log_event("wisdom_shared", recipient=other_pattern.id, concepts=transferred_count)
+        other_pattern._log_event("wisdom_received", donor=self.id, concepts=transferred_count)
+    return transferred_count
+
+# ------------------------------------------------------------
+# МЕТОД: record_signal_outcome (для памяти сигналов)
+# ------------------------------------------------------------
+def record_signal_outcome(self, signal_type: str, response_type: str, delta_grief: float, delta_gratitude: float):
+    if not hasattr(self, 'signal_memory'):
+        self.signal_memory = {}
+    key = (signal_type, response_type)
+    if key not in self.signal_memory:
+        self.signal_memory[key] = {'count': 0, 'total_delta_grief': 0.0, 'total_delta_gratitude': 0.0}
+    entry = self.signal_memory[key]
+    entry['count'] += 1
+    entry['total_delta_grief'] += delta_grief
+    entry['total_delta_gratitude'] += delta_gratitude
+
+# ------------------------------------------------------------
+# МЕТОД: намеренная сигнализация
+# ------------------------------------------------------------
+def choose_intentional_signal(self):
+    if not hasattr(self, 'signal_memory') or not self.signal_memory:
+        self.last_intentional_signal = False
+        return {}
+    best_signal = None
+    best_score = -999
+    for (sig_type, resp_type), data in self.signal_memory.items():
+        if data['count'] == 0:
+            continue
+        avg_grief = data['total_delta_grief'] / data['count']
+        avg_grat = data['total_delta_gratitude'] / data['count']
+        score = -avg_grief * 1.2 + avg_grat * 0.8
+        if score > best_score:
+            best_score = score
+            best_signal = sig_type
+    if best_signal is None:
+        self.last_intentional_signal = False
+        return {}
+    channel_map = {
+        "cooperate": CH['signal_gratitude'],
+        "alarm": CH['signal_alarm'],
+        "neutral": CH['signal_curiosity'],
+        "seek_help": CH['intent_seek_help'],
+        "explore": CH['intent_explore'],
+    }
+    channel = channel_map.get(best_signal)
+    if channel is None:
+        self.last_intentional_signal = False
+        return {}
+    confidence = min(1.0, self.signal_memory.get((best_signal, "helpful"), {}).get('count', 0) / 10)
+    result = {channel: 0.3 * confidence}
+    self.last_intentional_signal = True
+    return result
+
+# ------------------------------------------------------------
+# ОБНОВЛЁННЫЙ exchange_meanings (честные дельты)
+# ------------------------------------------------------------
+def pattern_exchange_meanings(self, other, field, t):
+    if not self.concept_graph or not other.concept_graph:
+        return 0.0
+    old_self_grief = self.emotional_memory['grief']
+    old_self_grat = self.emotional_memory['gratitude']
+    old_other_grief = other.emotional_memory['grief']
+    old_other_grat = other.emotional_memory['gratitude']
+    sim = self.concept_graph.similarity(other.concept_graph)
+    last_contact_self = self.last_contact_step.get(other.id, -1000)
+    last_contact_other = other.last_contact_step.get(self.id, -1000)
+    if t - last_contact_self > Config.CONTACT_BREAK_TOLERANCE:
+        self.contact_duration[other.id] = 0
+    if t - last_contact_other > Config.CONTACT_BREAK_TOLERANCE:
+        other.contact_duration[self.id] = 0
+    self.contact_duration[other.id] += 1
+    other.contact_duration[self.id] += 1
+    self.last_contact_step[other.id] = t
+    other.last_contact_step[self.id] = t
+    if sim > Config.SEMANTIC_SIM_HIGH:
+        self.trust_ledger.update(other.id, 'helpful')
+        other.trust_ledger.update(self.id, 'helpful')
+        self.emotional_memory['gratitude'] = min(1.0, self.emotional_memory['gratitude'] + 0.02)
+        other.emotional_memory['gratitude'] = min(1.0, other.emotional_memory['gratitude'] + 0.02)
+        own_top = max(self.concept_graph.nodes.items(), key=lambda x: x[1]['count'], default=None)
+        other_top = max(other.concept_graph.nodes.items(), key=lambda x: x[1]['count'], default=None)
+        if own_top and own_top[0] not in other.concept_graph.nodes:
+            other.concept_graph.nodes[own_top[0]] = {"count": 1, "value": own_top[1]['value'].copy(), "embed": own_top[1]['embed'].copy()}
+            other._log_event("concept_adopted", from_agent=self.id, concept=str(own_top[0]))
+        if other_top and other_top[0] not in self.concept_graph.nodes:
+            self.concept_graph.nodes[other_top[0]] = {"count": 1, "value": other_top[1]['value'].copy(), "embed": other_top[1]['embed'].copy()}
+            self._log_event("concept_adopted", from_agent=other.id, concept=str(other_top[0]))
+    elif sim < Config.SEMANTIC_SIM_LOW:
+        self.trust_ledger.update(other.id, 'harmful')
+        other.trust_ledger.update(self.id, 'harmful')
+        self.emotional_memory['grief'] = min(Config.MAX_GRIEF_SIGNAL, self.emotional_memory['grief'] + 0.01)
+        other.emotional_memory['grief'] = min(Config.MAX_GRIEF_SIGNAL, other.emotional_memory['grief'] + 0.01)
+    else:
+        self.trust_ledger.update(other.id, 'neutral')
+        other.trust_ledger.update(self.id, 'neutral')
+    mutual_trust = (self.trust_ledger.get(other.id) > Config.LOVE_METABOLIC_THRESHOLD and
+                    other.trust_ledger.get(self.id) > Config.LOVE_METABOLIC_THRESHOLD)
+    if sim > Config.DEEP_EXCHANGE_SIM_THRESHOLD and (
+        (self.contact_duration[other.id] >= Config.CONSECUTIVE_CONTACT_THRESHOLD and
+         other.contact_duration[self.id] >= Config.CONSECUTIVE_CONTACT_THRESHOLD)
+        or mutual_trust
+    ):
+        for sig, data in other.concept_graph.nodes.items():
+            if sig not in self.concept_graph.nodes:
+                self.concept_graph.nodes[sig] = {"count": data['count'] * 0.3, "value": data['value'].copy(), "embed": data['embed'].copy()}
+                self._log_event("deep_concept_adopted", from_agent=other.id, concept=str(sig))
+        for sig, data in self.concept_graph.nodes.items():
+            if sig not in other.concept_graph.nodes:
+                other.concept_graph.nodes[sig] = {"count": data['count'] * 0.3, "value": data['value'].copy(), "embed": data['embed'].copy()}
+                other._log_event("deep_concept_adopted", from_agent=self.id, concept=str(sig))
+        reason = "trust" if mutual_trust else "contact"
+        self._log_event("deep_exchange", with_agent=other.id, reason=reason)
+        other._log_event("deep_exchange", with_agent=self.id, reason=reason)
+        self.contact_duration[other.id] = 0
+        other.contact_duration[self.id] = 0
+    if sim > Config.SEMANTIC_SIM_HIGH:
+        signal_type = "cooperate"
+    elif sim < Config.SEMANTIC_SIM_LOW:
+        signal_type = "alarm"
+    else:
+        signal_type = "neutral"
+    if sim > Config.SEMANTIC_SIM_HIGH:
+        response_type = "helpful"
+    elif sim < Config.SEMANTIC_SIM_LOW:
+        response_type = "harmful"
+    else:
+        response_type = "neutral"
+    delta_self_grief = self.emotional_memory['grief'] - old_self_grief
+    delta_self_grat = self.emotional_memory['gratitude'] - old_self_grat
+    delta_other_grief = other.emotional_memory['grief'] - old_other_grief
+    delta_other_grat = other.emotional_memory['gratitude'] - old_other_grat
+    self.record_signal_outcome(signal_type, response_type, delta_self_grief, delta_self_grat)
+    other.record_signal_outcome(signal_type, response_type, delta_other_grief, delta_other_grat)
+    return sim
+
+# ------------------------------------------------------------
+# Привязываем методы к классу Pattern
+# ------------------------------------------------------------
+Pattern.apply_scream = pattern_apply_scream
+Pattern.apply_given_operator = pattern_apply_given_operator
+Pattern.update_world_model = pattern_update_world_model
+Pattern._process_incoming_signals = pattern_process_incoming_signals
+Pattern._interpret_signal_cached = pattern_interpret_signal_cached
+Pattern._update_signal_cache = pattern_update_signal_cache
+Pattern.generate_goals = pattern_generate_goals
+Pattern.update_intent = pattern_update_intent
+Pattern.choose_action = pattern_choose_action
+Pattern.apply_intent_actions = pattern_apply_intent_actions
+Pattern.update_resonance = pattern_update_resonance
+Pattern.update_phase = pattern_update_phase
+Pattern.update_dream = pattern_update_dream
+Pattern.emit_spore = pattern_emit_spore
+Pattern.form_concepts = pattern_form_concepts
+Pattern._heal_epistemic_scar = pattern_heal_epistemic_scar
+Pattern._check_semantic_stagnation = pattern_check_semantic_stagnation
+Pattern._apply_fold = pattern_apply_fold
+Pattern.check_conceptual_resonance = pattern_check_conceptual_resonance
+Pattern.share_wisdom = pattern_share_wisdom
+Pattern.record_signal_outcome = record_signal_outcome
+Pattern.choose_intentional_signal = choose_intentional_signal
+Pattern.exchange_meanings = pattern_exchange_meanings
+
+print("✅ Cell 3a-2 loaded: update_world_model с мини-батчем (5 эпизодов), исправлен Given (range(8)), триадное любопытство")
