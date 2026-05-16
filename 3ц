@@ -1,0 +1,242 @@
+# 832 v34.04 — Cell 3c-final: gradient redemption (без FSM) + zombie rescue + soul floor sequencing
+# Заменяет предыдущий Cell 3c-final полностью.
+
+def _complete_redemption(self, witness):
+    """Финализация искупления — единая точка выхода."""
+    self._log_event("redemption_complete", depth=round(getattr(self, '_redemption_depth', 1.0), 3))
+    if witness:
+        witness.record(self.id, "redemption_complete")
+    self._log_event("redeemed", arc="redemption")
+    self.role_type = "normal"
+    self.soul_weight = max(self.soul_weight, 0.7)
+    self.emotional_memory['grief'] = 0.1
+    self.emotional_memory['gratitude'] = 0.8
+    self._scar_of_light = True
+    self.body_memory = max(self.body_memory, 0.3)
+    self._deterministic_redemption_triggered = False
+    self._redemption_depth = 0.0
+    self._steps_since_trigger = 0
+    self._redemption_active = False
+    self._redemption_arc_step = 0  # обратная совместимость
+    if Config.ENABLE_CULTURAL_MEMORY and self.world and self.world.cultural_memory:
+        self.world.cultural_memory.deposit(self, "redemption", intensity=1.5)
+    if self.world and self.world.echo_system:
+        self.world.echo_system.store_memory_echo(self, "redemption_complete", intensity=1.5)
+
+Pattern._complete_redemption = _complete_redemption
+
+
+def pattern_continue_redemption_arc(self, field, witness, t, lineage_counts, given_counter,
+                                    observed, local_gratitude, local_grief):
+
+    # --- Счётчик шагов одиночества (для поцелуя упавшим) ---
+    if self.role_type == "disorganizer":
+        if not hasattr(self, '_fallen_steps'):
+            self._fallen_steps = 0
+        self._fallen_steps += 1
+
+    # --- Поцелуй упавшим (за упорство) ---
+    if self.role_type == "disorganizer" and not getattr(self, '_deterministic_redemption_triggered', False):
+        if getattr(self, '_fallen_steps', 0) >= 300:
+            self.emotional_memory['grief'] = max(0.0, self.emotional_memory['grief'] - 0.3)
+            self.emotional_memory['gratitude'] = min(1.0, self.emotional_memory['gratitude'] + 0.2)
+            self.soul_weight = min(1.0, self.soul_weight + 0.05)
+            self._log_event("kiss_of_the_fallen_persistent")
+            self._fallen_steps = 0
+
+    # --- Мягкое снижение души для неискуплённых ---
+    if self.role_type == "disorganizer" and not getattr(self, '_deterministic_redemption_triggered', False):
+        if self.soul_weight > Config.DETERMINISTIC_REDEMPTION_SOUL:
+            self.soul_weight -= 0.01
+
+    # === Forced Soul Collapse ===
+    if (self.role_type == "disorganizer" and
+            not getattr(self, '_forced_soul_collapse_done', False) and
+            self.disorganizer_age_at_birth > 0):
+        steps_since_birth = self.age - self.disorganizer_age_at_birth
+        if steps_since_birth >= Config.FORCED_SOUL_COLLAPSE_AGE and self.soul_weight > 0.4:
+            old_soul = self.soul_weight
+            self.soul_weight = Config.FORCED_SOUL_COLLAPSE_VALUE
+            self.emotional_memory['grief'] = Config.FORCED_SOUL_COLLAPSE_GRIEF_BOOST
+            self._forced_soul_collapse_done = True
+            self._log_event("forced_soul_collapse", old_soul=round(old_soul, 3),
+                            new_soul=round(self.soul_weight, 3))
+            if witness:
+                witness.record(self.id, "forced_soul_collapse",
+                               old_soul=old_soul, new_soul=self.soul_weight)
+
+    # === FIX 1: ZOMBIE RESCUE: альтернативный триггер для старых дизоргов ===
+    # Если soul совсем низкая, но grief уже выгорел → духовный кризис пустоты
+    if (self.role_type == "disorganizer" and
+            not getattr(self, '_deterministic_redemption_triggered', False) and
+            self.disorganizer_age_at_birth > 0):
+        steps_as_disorg = self.age - self.disorganizer_age_at_birth
+        if steps_as_disorg > 300 and self.soul_weight < 0.15:
+            # Принудительный grief-всплеск: пустота болезненнее страха
+            self.emotional_memory['grief'] = 0.55
+            self.emotional_memory['gratitude'] = 0.05
+            self._log_event("zombie_crisis", steps=steps_as_disorg, soul=self.soul_weight)
+
+    # === ТРИГГЕР ИСКУПЛЕНИЯ ===
+    if (self.role_type == "disorganizer" and
+            not getattr(self, '_deterministic_redemption_triggered', False)):
+        if (self.soul_weight < Config.DETERMINISTIC_REDEMPTION_SOUL and
+                self.emotional_memory['grief'] > Config.DETERMINISTIC_REDEMPTION_GRIEF):
+            self._deterministic_redemption_triggered = True
+            self._redemption_depth = 0.0        # непрерывная глубина
+            self._steps_since_trigger = 0
+            self._redemption_active = True
+            self._redemption_arc_step = 1       # обратная совместимость метрик
+            self.emotional_memory['grief'] = 0.7
+            self.semantic_state = "seeking_comfort"
+            self._log_event("deterministic_redemption_trigger",
+                            soul=self.soul_weight, grief=self.emotional_memory['grief'])
+            if witness:
+                witness.record(self.id, "deterministic_redemption_trigger",
+                               soul=self.soul_weight, grief=self.emotional_memory['grief'])
+
+    # === ГРАДИЕНТНОЕ ИСКУПЛЕНИЕ ===
+    if self.role_type == "disorganizer" and getattr(self, '_deterministic_redemption_triggered', False):
+        self._steps_since_trigger += 1
+
+        # --- Что движет прогрессом ---
+
+        # 1. Grief идёт вниз (0 = grief=0.7, 1.0 = grief=0)
+        grief_progress = max(0.0, (0.7 - self.emotional_memory['grief']) / 0.7)
+
+        # 2. Благодарность растёт
+        grat_progress = self.emotional_memory['gratitude']
+
+        # 3. Социальный катализатор: доверие от других
+        trust_avg = safe_mean(list(self.trust_ledger.entries.values()), 0.0)
+        social_catalyst = max(0.0, (trust_avg - 0.4) * 2.0)   # 0.4 trust → 0, 0.9 trust → 1.0
+
+        # 4. Соматика: если тело стабильно — глубина растёт быстрее
+        soma_stability = max(0.0, 1.0 - getattr(self, 'soma', 0.5))
+
+        # --- Скорость роста глубины ---
+        delta_depth = (
+            0.0002 +                              # базовый минимум
+            grief_progress  * 0.003 +             # главный драйвер
+            grat_progress   * 0.002 +             # усилитель
+            social_catalyst * 0.001 +             # социальный бонус
+            soma_stability  * 0.0005              # телесная стабильность
+        )
+
+        # --- Тормоз: если grief ещё высокий ---
+        if self.emotional_memory['grief'] > 0.75:
+            delta_depth *= 0.2    # почти заморожено пока grief высокий
+
+        # --- Тормоз: полевой grief давит на прогресс ---
+        field_grief_pressure = local_grief * 0.5
+        delta_depth = max(0.0, delta_depth - field_grief_pressure * 0.001)
+
+        self._redemption_depth = float(np.clip(
+            getattr(self, '_redemption_depth', 0.0) + delta_depth, 0.0, 1.0
+        ))
+
+        # --- Семантическое состояние следует за глубиной ---
+        depth = self._redemption_depth
+        if depth < 0.30:
+            self.semantic_state = "seeking_comfort"
+            self._redemption_arc_step = 1
+        elif depth < 0.65:
+            self.semantic_state = "grateful_but_cautious"
+            self._redemption_arc_step = 2
+        else:
+            self.semantic_state = "contentment"
+            self._redemption_arc_step = 3
+
+        # --- FIX 2: Soul floor sequencing — применяем ПОСЛЕ всех расчётов, запоминаем для следующего шага ---
+        depth = self._redemption_depth  # обновляем ссылку на случай изменений
+        soul_floor = Config.REDEMPTION_ARC_SOUL_LOCK + depth * 0.30
+        if self.soul_weight < soul_floor:
+            self.soul_weight = soul_floor
+            self._log_event("soul_floor_enforced", floor=round(soul_floor, 3))
+
+        # --- Лог промежуточного прогресса ---
+        if self._steps_since_trigger % 50 == 0:
+            self._log_event("redemption_progress",
+                            depth=round(depth, 3),
+                            grief=round(self.emotional_memory['grief'], 3),
+                            grat=round(self.emotional_memory['gratitude'], 3),
+                            soul=round(self.soul_weight, 3))
+
+        # === ЗАВЕРШЕНИЕ ===
+        # Основное: достигли глубины 1.0
+        if self._redemption_depth >= 1.0:
+            self._complete_redemption(witness)
+
+        # Досрочное: глубина > 0.8 + реально чистые эмоции
+        elif (self._redemption_depth > 0.80 and
+              self.emotional_memory['grief'] < 0.15 and
+              self.emotional_memory['gratitude'] > 0.5):
+            self._complete_redemption(witness)
+
+    # === Arc Tracker (стандартный) ===
+    completed_arc = self.arc_tracker.update(self.semantic_state)
+
+    if (completed_arc is None and
+            self.arc_tracker.active_arc == "grief_cycle" and
+            self.emotional_memory['grief'] > Config.ARC_GRIEF_FORCE_THRESHOLD):
+        self.arc_tracker.completed_arcs["grief_cycle"] = \
+            self.arc_tracker.completed_arcs.get("grief_cycle", 0) + 1
+        completed_arc = "grief_cycle"
+        self.epistemic_scar = max(Config.EPISTEMIC_SCAR_MIN,
+                                  self.epistemic_scar - Config.ARC_GRIEF_FORCE_HEAL)
+
+    # ArcTracker-искупление (запасной путь)
+    if completed_arc == "redemption" and self.role_type == "disorganizer":
+        self._complete_redemption(witness)
+
+    if completed_arc:
+        self._log_event("arc_completed", arc=completed_arc)
+        self.pred_error *= Config.ARC_COMPLETION_PRED_ERROR_REDUCTION
+        self._heal_epistemic_scar()
+        if Config.ENABLE_CULTURAL_MEMORY and self.world and self.world.cultural_memory:
+            self.world.cultural_memory.deposit(self, "arc_completed")
+
+    self._check_semantic_stagnation(witness=witness)
+
+    # Redemption Timer (для тех кто не в arc)
+    if self.role_type == "disorganizer" and self.redemption_timer > 0:
+        self.redemption_timer -= 1
+        if self.redemption_timer == 0:
+            self.semantic_state = "seeking_comfort"
+            self.emotional_memory['grief'] = 0.7
+            self._log_event("redemption_seeking")
+
+    # Quarantine
+    if self.quarantine_timer > 0:
+        self.quarantine_timer -= 1
+    elif self.epistemic_scar > Config.QUARANTINE_SCAR_THRESHOLD and self.role_type == "normal":
+        self.quarantine_timer = Config.QUARANTINE_SILENCE_STEPS
+        self._log_event("quarantine_enter", scar=self.epistemic_scar)
+
+    # Intent signals
+    for (x, y) in self.cells:
+        if self.emotional_memory['gratitude'] > 0.5:
+            field[x, y, CH['intent_cooperate']] = min(1.0,
+                field[x, y, CH['intent_cooperate']] + 0.3)
+        elif self.emotional_memory['grief'] > 0.5:
+            field[x, y, CH['intent_seek_help']] = min(1.0,
+                field[x, y, CH['intent_seek_help']] + 0.3)
+        elif local_gratitude > 0.3:
+            field[x, y, CH['intent_explore']] = min(1.0,
+                field[x, y, CH['intent_explore']] + 0.2)
+
+    # Стандартные шаги
+    self.update_world_model(observed)
+    self.generate_goals(field)
+    self.update_intent()
+    if self.age % 5 == 0 or self.local_phase in ("CRISIS", "DREAM") or self.cognitive_tension > 0.8:
+        self.form_concepts()
+    self.apply_intent_actions(field)
+    self.update_resonance(field)
+    self.update_phase(field)
+    self._heal_epistemic_scar()
+
+
+Pattern._continue_redemption_arc = pattern_continue_redemption_arc
+
+print("✅ Cell 3c-final v3: gradient redemption (depth 0→1, soul floor sequencing, zombie rescue)")
